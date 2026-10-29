@@ -6,10 +6,12 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * The employee aggregate. State changes only through {@link #applyHr}; there are no
- * setters. Deciding whether an event should be applied at all (stale, duplicate,
- * conflict) is the caller's job via the version policy; this class guards the
- * invariant that the HR version only moves forward.
+ * The employee aggregate. State changes only through {@link #applyHr} and
+ * {@link #applyTransport}; there are no setters. The two paths touch disjoint field
+ * groups and keep separate versions, so neither owner can overwrite or invalidate the
+ * other's data. Deciding whether an HR event should be applied at all (stale,
+ * duplicate, conflict) is the caller's job via the version policy; this class guards
+ * the invariant that each version only moves forward.
  */
 public final class Employee {
 
@@ -20,6 +22,8 @@ public final class Employee {
 	private long hrVersion;
 	private PayloadHash hrPayloadHash;
 	private Instant lastHrEventAt;
+	private TransportOwnedFields transportFields = TransportOwnedFields.NONE;
+	private long transportVersion;
 
 	private Employee(TenantId tenantId, EmployeeId employeeId) {
 		this.tenantId = tenantId;
@@ -72,6 +76,21 @@ public final class Employee {
 		return changed;
 	}
 
+	/**
+	 * Replaces the transport-owned fields if {@code expectedVersion} matches the stored
+	 * transport version (optimistic check, like an HTTP If-Match), then bumps it.
+	 */
+	public Set<EmployeeField> applyTransport(TransportOwnedFields incoming, long expectedVersion) {
+		Objects.requireNonNull(incoming, "incoming");
+		if (expectedVersion != transportVersion) {
+			throw new DomainException(ErrorCode.TRANSPORT_VERSION_MISMATCH);
+		}
+		Set<EmployeeField> changed = incoming.changedFieldsSince(transportFields);
+		transportFields = incoming;
+		transportVersion++;
+		return changed;
+	}
+
 	private Set<EmployeeField> replaceHrFields(HrOwnedFields incoming) {
 		Set<EmployeeField> changed = incoming.changedFieldsSince(hrFields);
 		hrFields = incoming;
@@ -120,9 +139,17 @@ public final class Employee {
 		return lastHrEventAt;
 	}
 
+	public TransportOwnedFields transportFields() {
+		return transportFields;
+	}
+
+	public long transportVersion() {
+		return transportVersion;
+	}
+
 	@Override
 	public String toString() {
 		return "Employee[tenantId=" + tenantId + ", employeeId=" + employeeId + ", status=" + status
-				+ ", hrVersion=" + hrVersion + "]";
+				+ ", hrVersion=" + hrVersion + ", transportVersion=" + transportVersion + "]";
 	}
 }

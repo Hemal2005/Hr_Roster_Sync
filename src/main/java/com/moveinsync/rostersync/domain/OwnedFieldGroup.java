@@ -12,7 +12,7 @@ import java.util.Set;
  * refuses a field owned by someone else, so a group can never carry a foreign value.
  * toString lists field names only: values are personal data.
  */
-public abstract sealed class OwnedFieldGroup permits HrOwnedFields {
+public abstract sealed class OwnedFieldGroup permits HrOwnedFields, TransportOwnedFields {
 
 	private final FieldOwner owner;
 	private final Map<EmployeeField, String> values;
