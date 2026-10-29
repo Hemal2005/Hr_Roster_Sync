@@ -12,9 +12,10 @@ import java.util.Objects;
  * </pre>
  *
  * The denominator is the number of employees active in the store before the run, not
- * the rows in the file: a truncated file shrinks its own row count and would hide the
- * problem. A truncated file trips the brake whatever the ratio, because a file that
- * stopped early cannot be trusted for its creates and updates either.
+ * the rows in the file: the rule is about the share of active employees that would
+ * disappear, and the file under suspicion cannot be its own baseline. A truncated file
+ * trips the brake whatever the ratio, because a file that stopped early cannot be
+ * trusted for its creates and updates either.
  */
 public final class SafetyBrake {
 
