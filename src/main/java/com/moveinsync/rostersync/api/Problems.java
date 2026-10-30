@@ -28,6 +28,8 @@ public final class Problems {
 
 	public static HttpStatus statusOf(ErrorCode code) {
 		return switch (code) {
+			case UNAUTHENTICATED -> HttpStatus.UNAUTHORIZED;
+			case FORBIDDEN -> HttpStatus.FORBIDDEN;
 			case NOT_FOUND, UNKNOWN_EMPLOYEE -> HttpStatus.NOT_FOUND;
 			case VERSION_CONFLICT -> HttpStatus.CONFLICT;
 			case TRANSPORT_VERSION_MISMATCH -> HttpStatus.PRECONDITION_FAILED;
