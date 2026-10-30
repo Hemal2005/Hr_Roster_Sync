@@ -28,9 +28,17 @@ public record IncomingHrRecord(
 		String officeCode,
 		String shiftCode) {
 
-	/** Deactivations only need the header; their other fields are not checked or used. */
+	/**
+	 * Create and update always carry the full HR state. A deactivation may carry it or
+	 * send only the header; if it sends any HR field, it must send a complete, valid set.
+	 */
 	public boolean carriesFields() {
-		return type != HrEventType.DEACTIVATE;
+		return type != HrEventType.DEACTIVATE || hasAnyHrField();
+	}
+
+	private boolean hasAnyHrField() {
+		return firstName != null || lastName != null || email != null || phone != null || managerId != null
+				|| officeCode != null || shiftCode != null;
 	}
 
 	public HrEvent toEvent(TenantId tenantId, String sourceSystem) {
@@ -38,7 +46,7 @@ public record IncomingHrRecord(
 		return switch (type) {
 			case CREATE -> new CreateEmployee(header, fields());
 			case UPDATE -> new UpdateEmployee(header, fields());
-			case DEACTIVATE -> new DeactivateEmployee(header);
+			case DEACTIVATE -> new DeactivateEmployee(header, carriesFields() ? fields() : null);
 		};
 	}
 

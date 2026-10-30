@@ -44,6 +44,28 @@ class EmployeeTest {
 	}
 
 	@Test
+	void exitWithFullStateForUnseenEmployeeCreatesItInactive() {
+		var exit = new DeactivateEmployee(TestEvents.header(5), TestEvents.fields("HYD-02", "NIGHT"));
+
+		Employee employee = Employee.createFrom(exit, hash(5));
+
+		assertThat(employee.status()).isEqualTo(EmployeeStatus.INACTIVE);
+		assertThat(employee.hrVersion()).isEqualTo(5);
+		assertThat(employee.hrFields().officeCode()).isEqualTo("HYD-02");
+	}
+
+	@Test
+	void exitWithFullStateReplacesHrFields() {
+		Employee employee = Employee.createFrom(create(1, "BLR-01", "MORNING"), hash(1));
+
+		var changed = employee.applyHr(new DeactivateEmployee(TestEvents.header(2), TestEvents.fields("HYD-02", "MORNING")),
+				hash(2));
+
+		assertThat(changed).containsExactlyInAnyOrder(EmployeeField.OFFICE_CODE, EmployeeField.STATUS);
+		assertThat(employee.status()).isEqualTo(EmployeeStatus.INACTIVE);
+	}
+
+	@Test
 	void updateReplacesHrFieldsAndReportsOnlyChangedFieldNames() {
 		Employee employee = Employee.createFrom(create(1, "BLR-01", "MORNING"), hash(1));
 

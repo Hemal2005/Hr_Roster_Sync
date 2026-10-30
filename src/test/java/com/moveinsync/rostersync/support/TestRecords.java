@@ -28,6 +28,11 @@ public final class TestRecords {
 				null, null, null, null, null, null, null);
 	}
 
+	public static IncomingHrRecord deactivateWithState(String employeeId, long version, String officeCode,
+			String shiftCode) {
+		return record(HrEventType.DEACTIVATE, employeeId, version, officeCode, shiftCode, PHONE);
+	}
+
 	public static IncomingHrRecord withPhone(String employeeId, long version, String phone) {
 		return record(HrEventType.UPDATE, employeeId, version, "BLR-01", "DAY", phone);
 	}

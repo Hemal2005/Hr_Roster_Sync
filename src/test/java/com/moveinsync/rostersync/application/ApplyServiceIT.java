@@ -2,6 +2,7 @@ package com.moveinsync.rostersync.application;
 
 import static com.moveinsync.rostersync.support.TestRecords.create;
 import static com.moveinsync.rostersync.support.TestRecords.deactivate;
+import static com.moveinsync.rostersync.support.TestRecords.deactivateWithState;
 import static com.moveinsync.rostersync.support.TestRecords.update;
 import static com.moveinsync.rostersync.support.TestRecords.withPhone;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -123,6 +124,24 @@ class ApplyServiceIT extends IntegrationTest {
 
 		assertThat(apply(deactivate("E000042", 2)).outcome()).isEqualTo(ApplyOutcome.APPLIED);
 		assertThat(stored().status()).isEqualTo(EmployeeStatus.INACTIVE);
+	}
+
+	@Test
+	void exitWithFullStateArrivingFirstIsKeptAndOlderEventsAreStale() {
+		assertThat(apply(deactivateWithState("E000042", 5, "HYD-02", "NIGHT")).outcome()).isEqualTo(ApplyOutcome.APPLIED);
+
+		assertThat(apply(create("E000042", 1, "BLR-01", "DAY")).outcome()).isEqualTo(ApplyOutcome.STALE);
+		assertThat(apply(update("E000042", 4, "BLR-01", "DAY")).outcome()).isEqualTo(ApplyOutcome.STALE);
+		assertThat(stored().status()).isEqualTo(EmployeeStatus.INACTIVE);
+		assertThat(stored().hrVersion()).isEqualTo(5);
+	}
+
+	@Test
+	void headerOnlyExitArrivingFirstCannotBeRecorded() {
+		// Known limitation: with no state there is nothing to create the employee from,
+		// so the exit is rejected and has to be resent or picked up by the nightly file.
+		assertThat(apply(deactivate("E000042", 5))).isEqualTo(ApplyResult.rejected(ErrorCode.UNKNOWN_EMPLOYEE));
+		assertThat(apply(update("E000042", 4, "BLR-01", "DAY")).outcome()).isEqualTo(ApplyOutcome.APPLIED);
 	}
 
 	@Test

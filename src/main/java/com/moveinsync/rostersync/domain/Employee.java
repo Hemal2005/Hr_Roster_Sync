@@ -32,18 +32,30 @@ public final class Employee {
 
 	/**
 	 * Builds a new employee from the first event seen for it. An update is accepted
-	 * because events carry the full HR state, so a lost create costs nothing.
+	 * because events carry the full HR state, so a lost create costs nothing. An exit is
+	 * accepted only if it carries the full state; a header-only exit has nothing to
+	 * build the employee from.
 	 */
 	public static Employee createFrom(HrEvent event, PayloadHash hash) {
 		Objects.requireNonNull(hash, "hash");
-		HrOwnedFields fields = switch (event) {
-			case CreateEmployee create -> create.fields();
-			case UpdateEmployee update -> update.fields();
-			case DeactivateEmployee deactivate -> throw new DomainException(ErrorCode.UNKNOWN_EMPLOYEE);
-		};
 		Employee employee = new Employee(event.tenantId(), event.employeeId());
-		employee.hrFields = fields;
-		employee.status = EmployeeStatus.ACTIVE;
+		switch (event) {
+			case CreateEmployee create -> {
+				employee.hrFields = create.fields();
+				employee.status = EmployeeStatus.ACTIVE;
+			}
+			case UpdateEmployee update -> {
+				employee.hrFields = update.fields();
+				employee.status = EmployeeStatus.ACTIVE;
+			}
+			case DeactivateEmployee deactivate -> {
+				if (!deactivate.carriesFullState()) {
+					throw new DomainException(ErrorCode.UNKNOWN_EMPLOYEE);
+				}
+				employee.hrFields = deactivate.fields();
+				employee.status = EmployeeStatus.INACTIVE;
+			}
+		}
 		employee.recordHrEvent(event, hash);
 		return employee;
 	}
@@ -92,7 +104,12 @@ public final class Employee {
 				changed.addAll(replaceHrFields(update.fields()));
 				changed.addAll(changeStatus(EmployeeStatus.ACTIVE));
 			}
-			case DeactivateEmployee deactivate -> changed.addAll(changeStatus(EmployeeStatus.INACTIVE));
+			case DeactivateEmployee deactivate -> {
+				if (deactivate.carriesFullState()) {
+					changed.addAll(replaceHrFields(deactivate.fields()));
+				}
+				changed.addAll(changeStatus(EmployeeStatus.INACTIVE));
+			}
 		}
 		recordHrEvent(event, hash);
 		return changed;

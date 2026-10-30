@@ -8,7 +8,8 @@ import java.security.NoSuchAlgorithmException;
 /**
  * SHA-256 over the HR state an event asserts: status, then every HR-owned field in a
  * fixed order. Create and update with the same fields hash the same (it is the state
- * that matters, not how it was sent); a deactivation hashes status alone. Each value is
+ * that matters, not how it was sent); a header-only deactivation hashes status alone,
+ * one carrying full state hashes status plus its fields. Each value is
  * written as a presence byte plus length plus UTF-8 bytes, so null differs from "" and
  * ("ab","c") differs from ("a","bc").
  *
@@ -21,7 +22,7 @@ public final class PayloadHasher {
 		return switch (event) {
 			case CreateEmployee create -> hashState(EmployeeStatus.ACTIVE, create.fields());
 			case UpdateEmployee update -> hashState(EmployeeStatus.ACTIVE, update.fields());
-			case DeactivateEmployee deactivate -> hashState(EmployeeStatus.INACTIVE, null);
+			case DeactivateEmployee deactivate -> hashState(EmployeeStatus.INACTIVE, deactivate.fields());
 		};
 	}
 

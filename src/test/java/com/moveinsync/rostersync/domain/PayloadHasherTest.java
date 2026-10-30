@@ -47,6 +47,15 @@ class PayloadHasherTest {
 	}
 
 	@Test
+	void exitWithFullStateHashesItsFieldsToo() {
+		var headerOnly = deactivate(8);
+		var withState = new DeactivateEmployee(header(8), TestEvents.fields("BLR-01", "MORNING"));
+
+		assertThat(hasher.hash(withState)).isNotEqualTo(hasher.hash(headerOnly));
+		assertThat(hasher.hash(withState)).isNotEqualTo(hasher.hash(update(8, "BLR-01", "MORNING")));
+	}
+
+	@Test
 	void nullAndEmptyAreDifferent() {
 		var withNullManager = new UpdateEmployee(header(1), new HrOwnedFields("A", "B", "e@x.io", "+1", null, "O", "S"));
 		var withEmptyManager = new UpdateEmployee(header(1), new HrOwnedFields("A", "B", "e@x.io", "+1", "", "O", "S"));

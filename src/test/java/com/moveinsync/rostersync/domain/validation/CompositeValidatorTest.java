@@ -5,7 +5,9 @@ import static org.assertj.core.api.Assertions.tuple;
 
 import com.moveinsync.rostersync.domain.CreateEmployee;
 import com.moveinsync.rostersync.domain.DeactivateEmployee;
+import com.moveinsync.rostersync.domain.EmployeeId;
 import com.moveinsync.rostersync.domain.ErrorCode;
+import com.moveinsync.rostersync.domain.EventHeader;
 import com.moveinsync.rostersync.domain.TenantId;
 import com.moveinsync.rostersync.domain.UpdateEmployee;
 import java.time.Instant;
@@ -168,9 +170,30 @@ class CompositeValidatorTest {
 	@Test
 	void deactivationOnlyNeedsTheHeader() {
 		var deactivate = new IncomingHrRecord(HrEventType.DEACTIVATE, "E000042", 8L, T0,
-				null, null, "garbage", "garbage", null, "CHN-99", null);
+				null, null, null, null, null, null, null);
 
 		assertThat(validator.validate(ACME, deactivate)).isEmpty();
+		assertThat(deactivate.toEvent(ACME, "workday"))
+				.isEqualTo(new DeactivateEmployee(new EventHeader(ACME, "workday", new EmployeeId("E000042"), 8, T0)));
+	}
+
+	@Test
+	void deactivationThatCarriesFieldsMustCarryAValidCompleteSet() {
+		var partialAndInvalid = new IncomingHrRecord(HrEventType.DEACTIVATE, "E000042", 8L, T0,
+				null, null, "garbage", "garbage", null, "CHN-99", null);
+
+		assertThat(codes(partialAndInvalid)).contains(ErrorCode.MISSING_REQUIRED_FIELD, ErrorCode.INVALID_EMAIL,
+				ErrorCode.INVALID_PHONE, ErrorCode.UNKNOWN_OFFICE);
+	}
+
+	@Test
+	void deactivationWithFullStateKeepsItsFields() {
+		var r = valid();
+		var exit = new IncomingHrRecord(HrEventType.DEACTIVATE, r.employeeId(), r.version(), r.occurredAt(),
+				r.firstName(), r.lastName(), r.email(), r.phone(), r.managerId(), r.officeCode(), r.shiftCode());
+
+		assertThat(validator.validate(ACME, exit)).isEmpty();
+		assertThat(((DeactivateEmployee) exit.toEvent(ACME, "workday")).carriesFullState()).isTrue();
 	}
 
 	@Test
