@@ -1,11 +1,16 @@
 package com.moveinsync.rostersync.application;
 
 import com.moveinsync.rostersync.domain.AppliedEventLog;
+import com.moveinsync.rostersync.domain.ChangeEvent;
+import com.moveinsync.rostersync.domain.ChangeEventType;
 import com.moveinsync.rostersync.domain.DomainException;
 import com.moveinsync.rostersync.domain.Employee;
+import com.moveinsync.rostersync.domain.EmployeeField;
 import com.moveinsync.rostersync.domain.EmployeeRepository;
+import com.moveinsync.rostersync.domain.EmployeeStatus;
 import com.moveinsync.rostersync.domain.ErrorCode;
 import com.moveinsync.rostersync.domain.HrEvent;
+import com.moveinsync.rostersync.domain.Outbox;
 import com.moveinsync.rostersync.domain.PayloadHash;
 import com.moveinsync.rostersync.domain.PayloadHasher;
 import com.moveinsync.rostersync.domain.StoredVersion;
@@ -15,8 +20,10 @@ import com.moveinsync.rostersync.domain.VersionPolicy;
 import com.moveinsync.rostersync.domain.validation.IncomingHrRecord;
 import com.moveinsync.rostersync.domain.validation.RecordValidator;
 import com.moveinsync.rostersync.domain.validation.ValidationError;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -26,7 +33,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * Applies one HR record: validate, then in its own transaction lock the employee row,
- * let the version policy decide, write the HR columns and record the applied change.
+ * let the version policy decide, write the HR columns, record the applied change and
+ * enqueue its change event. The update and the event commit or roll back together.
  * Each record gets its own transaction so one failure cannot undo the others in a batch.
  */
 @Service
@@ -37,15 +45,17 @@ public class ApplyService {
 	private final RecordValidator validator;
 	private final EmployeeRepository employees;
 	private final AppliedEventLog appliedEvents;
+	private final Outbox outbox;
 	private final TransactionTemplate tx;
 	private final VersionPolicy versionPolicy = new VersionPolicy();
 	private final PayloadHasher hasher = new PayloadHasher();
 
 	ApplyService(RecordValidator validator, EmployeeRepository employees, AppliedEventLog appliedEvents,
-			TransactionTemplate tx) {
+			Outbox outbox, TransactionTemplate tx) {
 		this.validator = validator;
 		this.employees = employees;
 		this.appliedEvents = appliedEvents;
+		this.outbox = outbox;
 		this.tx = tx;
 	}
 
@@ -85,27 +95,44 @@ public class ApplyService {
 			}
 		} catch (DomainException e) {
 			return ApplyResult.rejected(e.code());
+		} catch (RuntimeException e) {
+			// The transaction rolled back, so nothing of this record was written. Report it
+			// as retryable on this record alone instead of failing the whole batch. Class and
+			// location only: the message can contain the values that caused it.
+			StackTraceElement origin = e.getStackTrace().length > 0 ? e.getStackTrace()[0] : null;
+			log.error("hr event processing failed {} at {}", e.getClass().getName(), origin);
+			return ApplyResult.rejected(ErrorCode.PROCESSING_FAILED);
 		}
 	}
 
 	private ApplyResult decideAndWrite(HrEvent event, PayloadHash hash) {
 		Optional<Employee> stored = employees.findForUpdate(event.tenantId(), event.employeeId());
+		EmployeeStatus statusBefore = stored.map(Employee::status).orElse(null);
 		VersionDecision decision = versionPolicy.decide(stored.map(StoredVersion::of), event.version(), hash);
 		return switch (decision) {
 			case STALE -> ApplyResult.of(ApplyOutcome.STALE);
 			case DUPLICATE -> ApplyResult.of(ApplyOutcome.DUPLICATE);
 			case CONFLICT -> ApplyResult.rejected(ErrorCode.VERSION_CONFLICT);
 			case APPLY -> {
+				Employee employee;
+				Set<EmployeeField> changed;
 				if (stored.isEmpty()) {
-					employees.insert(event.tenantId(), Employee.createFrom(event, hash));
+					employee = Employee.createFrom(event, hash);
+					employees.insert(event.tenantId(), employee);
+					changed = EnumSet.copyOf(employee.hrFields().changedFieldsSince(null));
+					changed.add(EmployeeField.STATUS);
 				} else {
-					Employee employee = stored.get();
-					employee.applyHr(event, hash);
+					employee = stored.get();
+					changed = employee.applyHr(event, hash);
 					if (!employees.updateHrFields(event.tenantId(), employee)) {
 						throw new IllegalStateException("locked row changed version during apply");
 					}
 				}
 				appliedEvents.recordApplied(event.tenantId(), event.sourceSystem(), event.employeeId(), event.version());
+				ChangeEventType type = ChangeEventType.forHrChange(stored.isEmpty()
+						? Optional.empty()
+						: Optional.of(statusBefore), employee.status());
+				outbox.enqueue(ChangeEvent.of(employee, type, changed, event.occurredAt()));
 				yield ApplyResult.of(ApplyOutcome.APPLIED);
 			}
 		};

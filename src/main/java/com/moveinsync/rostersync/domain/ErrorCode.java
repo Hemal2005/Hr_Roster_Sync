@@ -13,6 +13,8 @@ public enum ErrorCode {
 	UNKNOWN_OFFICE,
 	UNKNOWN_EMPLOYEE,
 	VERSION_CONFLICT,
+	/** Unexpected failure on this record; nothing was written, sending it again is safe. */
+	PROCESSING_FAILED,
 	TRANSPORT_VERSION_MISMATCH,
 	PRECONDITION_REQUIRED,
 	FIELD_NOT_OWNED,

@@ -1,12 +1,16 @@
 package com.moveinsync.rostersync.application;
 
+import com.moveinsync.rostersync.domain.ChangeEvent;
+import com.moveinsync.rostersync.domain.ChangeEventType;
 import com.moveinsync.rostersync.domain.DomainException;
 import com.moveinsync.rostersync.domain.Employee;
 import com.moveinsync.rostersync.domain.EmployeeField;
 import com.moveinsync.rostersync.domain.EmployeeId;
 import com.moveinsync.rostersync.domain.EmployeeRepository;
 import com.moveinsync.rostersync.domain.ErrorCode;
+import com.moveinsync.rostersync.domain.Outbox;
 import com.moveinsync.rostersync.domain.TenantId;
+import java.time.Instant;
 import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,10 +27,12 @@ public class EmployeeService {
 	private static final Logger log = LoggerFactory.getLogger(EmployeeService.class);
 
 	private final EmployeeRepository employees;
+	private final Outbox outbox;
 	private final TransactionTemplate tx;
 
-	EmployeeService(EmployeeRepository employees, TransactionTemplate tx) {
+	EmployeeService(EmployeeRepository employees, Outbox outbox, TransactionTemplate tx) {
 		this.employees = employees;
+		this.outbox = outbox;
 		this.tx = tx;
 	}
 
@@ -49,6 +55,7 @@ public class EmployeeService {
 			if (!employees.updateTransportFields(tenantId, employee, expectedVersion)) {
 				throw new DomainException(ErrorCode.TRANSPORT_VERSION_MISMATCH);
 			}
+			outbox.enqueue(ChangeEvent.of(employee, ChangeEventType.TRANSPORT_UPDATED, changed, Instant.now()));
 			log.info("transport fields {} updated employee={} transportVersion={}", changed, employeeId,
 					employee.transportVersion());
 			return employee;

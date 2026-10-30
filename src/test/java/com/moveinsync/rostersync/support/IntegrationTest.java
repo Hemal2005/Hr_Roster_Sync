@@ -22,7 +22,7 @@ public abstract class IntegrationTest {
 
 	@BeforeEach
 	void emptyTables() {
-		jdbc.execute("TRUNCATE employee_event_log, employee, office, tenant");
+		jdbc.execute("TRUNCATE outbox, employee_event_log, employee, office, tenant");
 	}
 
 	protected void givenTenant(String tenantId, String... officeCodes) {
