@@ -4,6 +4,7 @@ import com.moveinsync.rostersync.application.LocalCache;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.micrometer.metrics.test.autoconfigure.AutoConfigureMetrics;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -16,6 +17,8 @@ import org.springframework.test.context.ActiveProfiles;
  */
 @SpringBootTest
 @ActiveProfiles("test")
+// Tests switch metric export off by default; keep it on so /actuator/prometheus exists.
+@AutoConfigureMetrics
 @Import({PostgresContainerConfig.class, RedpandaContainerConfig.class})
 public abstract class IntegrationTest {
 

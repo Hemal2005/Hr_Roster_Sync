@@ -23,6 +23,11 @@ import com.moveinsync.rostersync.domain.VersionPolicy;
 import com.moveinsync.rostersync.domain.validation.IncomingHrRecord;
 import com.moveinsync.rostersync.domain.validation.RecordValidator;
 import com.moveinsync.rostersync.domain.validation.ValidationError;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.EnumSet;
 import java.util.List;
@@ -52,17 +57,25 @@ public class ApplyService {
 	private final Outbox outbox;
 	private final TransactionTemplate tx;
 	private final EmployeeReadCache readCache;
+	private final MeterRegistry meters;
+	private final Clock clock;
+	private final Counter retries;
 	private final VersionPolicy versionPolicy = new VersionPolicy();
 	private final PayloadHasher hasher = new PayloadHasher();
 
 	ApplyService(RecordValidator validator, EmployeeRepository employees, AppliedEventLog appliedEvents,
-			Outbox outbox, TransactionTemplate tx, EmployeeReadCache readCache) {
+			Outbox outbox, TransactionTemplate tx, EmployeeReadCache readCache, MeterRegistry meters, Clock clock) {
 		this.validator = validator;
 		this.employees = employees;
 		this.appliedEvents = appliedEvents;
 		this.outbox = outbox;
 		this.tx = tx;
 		this.readCache = readCache;
+		this.meters = meters;
+		this.clock = clock;
+		this.retries = Counter.builder("hr.apply.retries")
+				.description("Records retried after losing the race to insert a new employee")
+				.register(meters);
 	}
 
 	public ApplyResult apply(TenantId tenantId, String sourceSystem, IncomingHrRecord record) {
@@ -72,6 +85,7 @@ public class ApplyService {
 		}
 		try {
 			ApplyResult result = validateAndApply(tenantId, sourceSystem, record);
+			count(tenantId, sourceSystem, record, result);
 			if (result.outcome() == ApplyOutcome.APPLIED) {
 				readCache.evict(tenantId, new EmployeeId(record.employeeId()));
 			}
@@ -84,6 +98,26 @@ public class ApplyService {
 		} finally {
 			MDC.remove("tenantId");
 			MDC.remove("employeeId");
+		}
+	}
+
+	/**
+	 * One count per record by outcome and code, and for live events the time from HR's
+	 * {@code occurredAt} to now. Reconciliation rows carry the export's time, so they
+	 * are left out of the lag. Tags are tenant ids and codes only.
+	 */
+	private void count(TenantId tenantId, String sourceSystem, IncomingHrRecord record, ApplyResult result) {
+		meters.counter("hr.events", "tenant", tenantId.value(), "outcome", result.outcome().name(),
+				"code", result.errorCode() == null ? "NONE" : result.errorCode().name()).increment();
+		if (result.outcome() == ApplyOutcome.APPLIED && record.occurredAt() != null
+				&& !ReconciliationSource.NAME.equals(sourceSystem)) {
+			Duration lag = Duration.between(record.occurredAt(), clock.instant());
+			Timer.builder("hr.ingest.lag")
+					.description("From the HR system's occurredAt to the change being committed here")
+					.tag("tenant", tenantId.value())
+					.publishPercentileHistogram()
+					.register(meters)
+					.record(lag.isNegative() ? Duration.ZERO : lag);
 		}
 	}
 
@@ -140,6 +174,7 @@ public class ApplyService {
 			} catch (DuplicateKeyException firstInsertLostARace) {
 				// Two first events for a new employee both saw no row; the other one inserted
 				// it. The row exists now, so the retry locks it and decides normally.
+				retries.increment();
 				return tx.execute(status -> decideAndWrite(event, hash));
 			}
 		} catch (DomainException e) {

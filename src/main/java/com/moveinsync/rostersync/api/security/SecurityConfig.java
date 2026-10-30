@@ -48,6 +48,10 @@ class SecurityConfig implements WebMvcConfigurer {
 						.requestMatchers(HttpMethod.GET, "/api/v1/reconciliations/**").hasRole(Role.OPERATOR.name())
 						.requestMatchers(HttpMethod.POST, "/api/v1/reconciliations/*/approve", "/api/v1/reconciliations/*/reject")
 						.hasRole(Role.OPERATOR.name())
+						// For load balancers and Prometheus. Health shows only UP/DOWN; metrics carry
+						// tenant ids and codes, never personal data.
+						.requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**", "/actuator/prometheus")
+						.permitAll()
 						// Only mapped under the dev and demo profiles; elsewhere it is a 404.
 						.requestMatchers(HttpMethod.POST, "/dev/token").permitAll()
 						.requestMatchers("/error").permitAll()

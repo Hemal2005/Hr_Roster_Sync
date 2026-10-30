@@ -5,7 +5,9 @@ import com.moveinsync.rostersync.domain.reconciliation.BrakeDecision;
 import com.moveinsync.rostersync.domain.reconciliation.BrakeThreshold;
 import com.moveinsync.rostersync.domain.reconciliation.SafetyBrake;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 import org.slf4j.Logger;
@@ -46,10 +48,12 @@ public class ReconciliationService {
 		MDC.put("tenantId", tenantId.value());
 		MDC.put("runId", runId.toString());
 		try {
+			long started = System.nanoTime();
 			PlanSummary plan = planner.plan(runId, tenantId, asOf, export);
 			store.recordPlan(runId, plan);
 			BrakeDecision decision = brake.evaluate(plan.activeBefore(), plan.toDeactivate(), plan.trailerOk(), threshold);
 			store.recordBrake(runId, decision);
+			recordDuration(tenantId, "plan", decision instanceof BrakeDecision.Trip ? "TRIPPED" : "PASSED", started);
 			if (decision instanceof BrakeDecision.Trip trip) {
 				meters.counter("reconciliation.brake.tripped", "tenant", tenantId.value(), "reason", trip.reason().name())
 						.increment();
@@ -71,9 +75,19 @@ public class ReconciliationService {
 
 	/** Applies a run that is already APPLYING (after planning, or after an operator approved it). */
 	public RunStatus applyPlan(UUID runId, TenantId tenantId, Instant asOf) {
+		long started = System.nanoTime();
 		ReconciliationApplier.Outcome outcome = applier.apply(runId, tenantId, asOf);
 		store.recordApplied(runId, outcome.applied(), outcome.skipped());
+		recordDuration(tenantId, "apply", "COMPLETED", started);
 		log.info("reconciliation applied={} skipped={}", outcome.applied(), outcome.skipped());
 		return RunStatus.COMPLETED;
+	}
+
+	private void recordDuration(TenantId tenantId, String phase, String result, long startedNanos) {
+		Timer.builder("reconciliation.duration")
+				.description("Time to plan a nightly export, or to apply its plan")
+				.tags("tenant", tenantId.value(), "phase", phase, "result", result)
+				.register(meters)
+				.record(Duration.ofNanos(System.nanoTime() - startedNanos));
 	}
 }

@@ -10,10 +10,11 @@ import com.moveinsync.rostersync.application.ChangeEventPublisher;
 import com.moveinsync.rostersync.application.OutboxRelay;
 import com.moveinsync.rostersync.application.PendingOutbox;
 import com.moveinsync.rostersync.domain.TenantId;
-import com.moveinsync.rostersync.support.FaultInjectingPublisher;
 import com.moveinsync.rostersync.support.FaultInjectingPublisher.CrashPoint;
+import com.moveinsync.rostersync.support.FaultInjectingPublisher;
 import com.moveinsync.rostersync.support.IntegrationTest;
 import com.moveinsync.rostersync.support.TopicReader;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -77,7 +78,7 @@ class OutboxCrashRecoveryIT extends IntegrationTest {
 	}
 
 	private OutboxRelay relayWith(ChangeEventPublisher publisher) {
-		return new OutboxRelay(pendingOutbox, publisher, tx, 100);
+		return new OutboxRelay(pendingOutbox, publisher, tx, 100, new SimpleMeterRegistry());
 	}
 
 	private Map<String, Object> sideEffects() {

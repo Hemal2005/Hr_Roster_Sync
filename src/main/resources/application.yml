@@ -34,6 +34,20 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 
+management:
+  endpoints:
+    web:
+      exposure:
+        # Only these; env, beans, heapdump and the rest stay closed.
+        include: health, prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: hr-roster-sync
+
 rostersync:
   reconciliation:
     # Share of active employees an export may miss before the run waits for an operator.

@@ -12,6 +12,7 @@ import com.moveinsync.rostersync.application.PendingOutbox;
 import com.moveinsync.rostersync.domain.TenantId;
 import com.moveinsync.rostersync.support.IntegrationTest;
 import com.moveinsync.rostersync.support.TopicReader;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -71,7 +72,7 @@ class BrokerDownIT extends IntegrationTest {
 				ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 500,
 				ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 1000));
 		ChangeEventPublisher downBroker = new KafkaChangeEventPublisher(new KafkaTemplate<>(unreachable), topic, 2000);
-		relayDuringOutage = new OutboxRelay(pendingOutbox, downBroker, tx, 100);
+		relayDuringOutage = new OutboxRelay(pendingOutbox, downBroker, tx, 100, new SimpleMeterRegistry());
 	}
 
 	@AfterEach

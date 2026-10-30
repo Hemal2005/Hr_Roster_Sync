@@ -1,5 +1,7 @@
 package com.moveinsync.rostersync.application;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,13 +28,21 @@ public class OutboxRelay {
 	private final ChangeEventPublisher publisher;
 	private final TransactionTemplate tx;
 	private final int batchSize;
+	private final Counter published;
+	private final Counter failures;
 
 	public OutboxRelay(PendingOutbox outbox, ChangeEventPublisher publisher, TransactionTemplate tx,
-			@Value("${rostersync.outbox.batch-size:100}") int batchSize) {
+			@Value("${rostersync.outbox.batch-size:100}") int batchSize, MeterRegistry meters) {
 		this.outbox = outbox;
 		this.publisher = publisher;
 		this.tx = tx;
 		this.batchSize = batchSize;
+		this.published = Counter.builder("outbox.published")
+				.description("Change events acknowledged by the broker")
+				.register(meters);
+		this.failures = Counter.builder("outbox.publish.failures")
+				.description("Publish attempts that failed; the batch stopped and will be retried")
+				.register(meters);
 	}
 
 	public RelayResult relayOnce() {
@@ -48,12 +58,14 @@ public class OutboxRelay {
 				} catch (RuntimeException e) {
 					String code = errorCode(e);
 					outbox.markFailed(message.id(), code);
+					failures.increment();
 					MDC.put("eventId", message.eventId().toString());
 					log.warn("outbox publish failed id={} code={}; batch stopped", message.id(), code);
 					MDC.remove("eventId");
 					return new RelayResult(published, true, false);
 				}
 				outbox.markPublished(message.id());
+				this.published.increment();
 				published++;
 			}
 			return new RelayResult(published, false, false);

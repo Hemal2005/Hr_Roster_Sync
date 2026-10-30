@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.moveinsync.rostersync.domain.TenantId;
 import com.moveinsync.rostersync.support.IntegrationTest;
 import com.moveinsync.rostersync.support.TopicReader;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -118,7 +119,7 @@ class OutboxRelayIT extends IntegrationTest {
 			kafkaPublisher.publish(message);
 		};
 
-		var first = new OutboxRelay(pendingOutbox, failsOnSecond, tx, 100).relayOnce();
+		var first = new OutboxRelay(pendingOutbox, failsOnSecond, tx, 100, new SimpleMeterRegistry()).relayOnce();
 
 		assertThat(first.published()).isEqualTo(1);
 		assertThat(first.stoppedOnFailure()).isTrue();
