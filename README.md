@@ -115,11 +115,13 @@ Each rule from the case study: what it says, what goes wrong without it, how it 
   - Error responses carry a stable `code` and the `traceId`, plus field *names* for validation errors.
   - Exception messages are never copied into a response or a log line, because a database message can contain the very value it rejected.
   - `toString()` of every domain object that holds personal data lists field names only.
+  - Metric labels are tenant ids, outcomes and codes. Change events carry field *names*, not values.
+  - A broken line in a nightly file is reported by line number and code. Its first field is not reported as an employee id, because a garbled line can start with a name.
 - **Proof.**
   - [`IngestControllerIT.errorReportContainsNoPersonalData`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java).
   - [`GlobalExceptionHandlerTest`](src/test/java/com/moveinsync/rostersync/api/GlobalExceptionHandlerTest.java).
   - The domain `toString` tests.
-  - A test that captures every log line of the whole suite comes with the monitoring work.
+  - [`NoPiiInLogsIT`](src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java) runs every flow that handles personal data with distinctive values, valid and invalid. It covers ingest with every rejection type, transport edits, a booking cancelled by an exit through the broker, and a nightly file with garbled lines. It then searches all log output (background threads included), the metrics scrape and every error body for those values. This test found the garbled-line case above.
 
 ### Reliable change events (the outbox)
 
@@ -273,11 +275,61 @@ _Pending._
 
 ## Monitoring — what on-call sees at 3 AM
 
-_Pending._
+`docker compose up -d prometheus grafana` starts:
+- **Prometheus** on [localhost:9090](http://localhost:9090), scraping `/actuator/prometheus` every 15 s;
+- **Grafana** on [localhost:3000](http://localhost:3000), with the provisioned dashboard **HR Roster Sync** (anonymous view; `admin`/`admin` for local editing).
+
+The app exposes only `/actuator/health` (UP or DOWN, plus `/liveness` and `/readiness`) and `/actuator/prometheus`, both without a token. Labels are tenant ids, outcomes and codes, never personal data. In production both would sit behind the internal network.
+
+### The metrics
+
+| Metric | Meaning | If it's high |
+|---|---|---|
+| `hr_events_total{tenant,outcome,code}` | Every HR record, by outcome (`APPLIED`, `DUPLICATE`, `STALE`, `REJECTED`) and error code | `REJECTED` by `code` shows *what* the client is sending wrong. `STALE` / `DUPLICATE` are normal for retries, but a jump means the client is replaying |
+| `hr_ingest_lag_seconds` (histogram) | From HR's `occurredAt` to our commit, live events only | The client's HR integration is late, or our ingest is slow |
+| `hr_apply_retries_total` | Records retried after two first events for a new employee raced | A few are normal; a steady stream means the client sends many parallel creates |
+| `hr_owned_field_violation_total{tenant,field}` | Transport-owned fields sent by HR, ignored | Tell the client to stop sending them |
+| `outbox_depth` | Change events not yet acknowledged by the broker | Downstream (bookings) is behind; see the next row |
+| `outbox_oldest_age_seconds` | Age of the oldest unsent event | > 60 s: the broker is down or rejecting. Ingest still works; see `outbox.last_error_code` |
+| `outbox_published_total`, `outbox_publish_failures_total` | Relay throughput and failed attempts | Failures with a flat `published` mean an outage |
+| `kafka_consumer_fetch_manager_records_lag_max` | How far the booking-cancellation consumer is behind | Cancellations are delayed; check the consumer's logs |
+| `reconciliation_duration_seconds{phase,result}` | Time to plan a nightly file / apply its plan | Plan > 60 s means the file or the table has grown past the design; see Performance |
+| `reconciliation_brake_tripped_total{tenant,reason}` | Runs held by the safety brake | A person must look at the run: approve or reject |
+| `cache_gets_total{cache,result}` | Hits and misses of the `offices` and `employees` caches | A low hit ratio means more database reads, not wrong answers |
+
+### The alerts ([`ops/prometheus/alerts.yml`](ops/prometheus/alerts.yml))
+
+| Alert | Fires when | Severity |
+|---|---|---|
+| `ReconciliationBrakeTripped` | A run was held in the last 15 minutes, including a tenant's first-ever trip (a new counter series, which `increase()` alone misses) | page |
+| `OutboxNotDraining` | The oldest unsent event is older than 60 s for 1 minute | page |
+| `HrRejectionSpike` | More than 20 % of a tenant's records are rejected for 10 minutes, at more than 3 records a minute | ticket |
+| `HrIngestLagHigh` | p99 ingest lag above 5 minutes for 15 minutes | ticket |
+| `RosterSyncDown` | Prometheus cannot scrape the app for 2 minutes | page |
+
+The rules have unit tests ([`alerts.test.yml`](ops/prometheus/alerts.test.yml)): `scripts/check-alerts.sh` runs `promtool` from the same Prometheus image to validate the config and test every rule, including "a single rejection in a quiet hour is not a spike".
+
+### Proof
+- [`MetricsIT`](src/test/java/com/moveinsync/rostersync/MetricsIT.java) sends real traffic (applied, duplicate, stale, two rejection codes, a foreign field, a read, a relay pass, a truncated nightly file). It then asserts every series above on `/actuator/prometheus`, the outbox depth before (3) and after (0) the relay, and that `env`, `beans`, `heapdump` and `metrics` are not exposed.
+- `scripts/check-alerts.sh`: every rule fires and resolves as specified. Changing a threshold makes it fail.
+- Run live: with the app on the host, the scrape target was up, a truncated export made `ReconciliationBrakeTripped` fire, and Grafana answered queries through its provisioned Prometheus data source.
 
 ## Caching
 
-_Pending._
+Two in-process [Caffeine](https://github.com/ben-manes/caffeine) caches. Each instance of the service has its own.
+
+| Cache | Holds | TTL / size | Evicted | Stale for at most |
+|---|---|---|---|---|
+| `offices` ([`CachingOfficeDirectory`](src/main/java/com/moveinsync/rostersync/infrastructure/persistence/CachingOfficeDirectory.java)) | "this office code is active for this tenant" | 5 min / 10,000 | on expiry | 5 min, and only one way: a deactivated office may still be accepted. A new office is accepted at once, because "unknown" answers are not cached |
+| `employees` ([`EmployeeReadCache`](src/main/java/com/moveinsync/rostersync/application/EmployeeReadCache.java)) | employee records for `GET /employees/{id}` and `/me` | 30 s / 50,000 | by this instance after every change it commits (HR apply, deactivation as missing, transport edit) | 30 s for changes made by *another* instance |
+
+- **Never from the cache:** version checks and writes. Every write locks the row and reads it from the database (`SELECT … FOR UPDATE`). A stale read can therefore never cause a wrong write.
+- **The ETag case:** a cached record can carry an old transport version. A `PATCH` with that `If-Match` gets `412`, so the edit is refused, never lost.
+- **Why these two:** validating a 1,000-record batch or a 200,000-row file would otherwise query `office` once per record; admin screens re-read the same employees. Employee writes are not cached: they must see the truth.
+- **Multi-instance:** no cross-instance invalidation. The TTLs are the bound, and they are stated rather than hidden. A shared cache (Redis) or broadcast eviction would be the next step, and isn't needed at this scale.
+- **Proof.**
+  - [`OfficeCacheTest`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/OfficeCacheTest.java) and [`EmployeeReadCacheTest`](src/test/java/com/moveinsync/rostersync/application/EmployeeReadCacheTest.java) drive a fake clock through hits, expiry exactly at the TTL, "unknown is not cached", tenant separation and eviction.
+  - [`EmployeeReadCacheIT`](src/test/java/com/moveinsync/rostersync/api/employee/EmployeeReadCacheIT.java) checks over HTTP that local changes show at once, that an outside change shows once the entry is gone, and that a stale ETag gets `412`.
 
 ## Performance and cost
 
@@ -489,11 +541,13 @@ Prerequisites: JDK 21 and Docker. Maven is not required; the project ships with 
 
 ```bash
 docker compose up -d postgres redpanda                 # Postgres 16 on :5432, Kafka-compatible Redpanda on :19092
+docker compose up -d prometheus grafana                # monitoring: Prometheus on :9090, Grafana on :3000 (dashboard "HR Roster Sync")
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev  # the API on localhost:8080, with a local-only signing key
 ./mvnw test                                            # unit tests, no Docker needed
 ./mvnw verify                                          # unit + integration tests; each run starts its own Postgres
 ./mvnw verify -Pbenchmark                              # only the 200,000-employee reconciliation benchmark, 256 MB heap
 scripts/generate-export.sh --rows 200000               # a synthetic nightly export in data/generated/
+scripts/check-alerts.sh                                # validate the Prometheus config and unit-test the alert rules (Docker)
 docker compose down -v                                 # stop and delete the local database
 ```
 
