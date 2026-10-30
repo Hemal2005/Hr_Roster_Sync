@@ -6,8 +6,10 @@ rule_files:
   - /etc/prometheus/alerts.yml
 
 scrape_configs:
+  # The app container started by docker compose. To watch an app started on the Mac
+  # instead (./mvnw spring-boot:run, with the app container stopped), use the target
+  # host.docker.internal:8080.
   - job_name: hr-roster-sync
     metrics_path: /actuator/prometheus
     static_configs:
-      # The app running on the Mac (./mvnw spring-boot:run), seen from inside Docker.
-      - targets: ["host.docker.internal:8080"]
+      - targets: ["app:8080"]

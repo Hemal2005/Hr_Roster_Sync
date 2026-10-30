@@ -1,0 +1,7 @@
+# Send the build only what it needs; everything else stays on this machine.
+*
+!pom.xml
+!mvnw
+!.mvn/
+!src/
+src/test/

@@ -1,0 +1,3 @@
+# Local evaluation only (docker compose). Never enable in a real deployment: it turns on
+# POST /dev/token, which issues a token for any tenant and role.
+# The signing key comes from ROSTERSYNC_SECURITY_JWT_SECRET, which docker-compose.yml sets.

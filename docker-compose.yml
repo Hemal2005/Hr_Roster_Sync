@@ -38,6 +38,29 @@ services:
       timeout: 5s
       retries: 20
 
+  app:
+    build: .
+    image: hr-roster-sync:local
+    environment:
+      # Local evaluation only: turns on POST /dev/token and loads demo tenants and offices.
+      SPRING_PROFILES_ACTIVE: demo
+      ROSTERSYNC_SECURITY_JWT_SECRET: ${ROSTERSYNC_SECURITY_JWT_SECRET:-demo-only-signing-key-not-for-production-01}
+      DB_HOST: postgres
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/actuator/health/readiness || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
   prometheus:
     image: prom/prometheus:v3.15.0
     command:
