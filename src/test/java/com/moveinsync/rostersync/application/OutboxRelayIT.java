@@ -13,7 +13,11 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -134,6 +138,85 @@ class OutboxRelayIT extends IntegrationTest {
 
 		assertThat(second.published()).isEqualTo(2);
 		assertThat(unpublished()).isZero();
+	}
+
+	/**
+	 * Acknowledges each event a little later on another thread (or fails the ones whose
+	 * key is {@code failKey}) and records how many events are in flight at once.
+	 */
+	private static final class SlowBroker implements ChangeEventPublisher {
+		final String failKey;
+		final List<String> sentKeys = new CopyOnWriteArrayList<>();
+		final Map<String, AtomicInteger> inFlightByKey = new ConcurrentHashMap<>();
+		final AtomicInteger inFlight = new AtomicInteger();
+		final AtomicInteger maxInFlight = new AtomicInteger();
+		final AtomicInteger maxSameKeyInFlight = new AtomicInteger();
+
+		SlowBroker(String failKey) {
+			this.failKey = failKey;
+		}
+
+		@Override
+		public void publish(OutboxMessage message) {
+			throw new UnsupportedOperationException("the relay sends asynchronously");
+		}
+
+		@Override
+		public CompletableFuture<Void> publishAsync(OutboxMessage message) {
+			sentKeys.add(message.key());
+			maxInFlight.accumulateAndGet(inFlight.incrementAndGet(), Math::max);
+			AtomicInteger sameKey = inFlightByKey.computeIfAbsent(message.key(), k -> new AtomicInteger());
+			maxSameKeyInFlight.accumulateAndGet(sameKey.incrementAndGet(), Math::max);
+			return CompletableFuture.runAsync(() -> {
+				inFlight.decrementAndGet();
+				sameKey.decrementAndGet();
+				if (message.key().equals(failKey)) {
+					throw new IllegalStateException("broker unavailable");
+				}
+			}, CompletableFuture.delayedExecutor(50, TimeUnit.MILLISECONDS));
+		}
+	}
+
+	private void twoEventsEachForThreeEmployees() {
+		for (String id : List.of("E1", "E2", "E3")) {
+			applyService.apply(ACME, "workday", create(id, 1, "BLR-01", "DAY"));
+		}
+		for (String id : List.of("E1", "E2", "E3")) {
+			applyService.apply(ACME, "workday", update(id, 2, "HYD-02", "DAY"));
+		}
+	}
+
+	@Test
+	void differentEmployeesAreInFlightTogetherButOneEmployeeNeverHasTwo() {
+		twoEventsEachForThreeEmployees();
+		SlowBroker broker = new SlowBroker(null);
+
+		var result = new OutboxRelay(pendingOutbox, broker, tx, 100, new SimpleMeterRegistry()).relayOnce();
+
+		assertThat(result.published()).isEqualTo(6);
+		assertThat(unpublished()).isZero();
+		assertThat(broker.maxInFlight).hasValue(3);
+		assertThat(broker.maxSameKeyInFlight).hasValue(1);
+		assertThat(broker.sentKeys).containsExactly("acme:E1", "acme:E2", "acme:E3", "acme:E1", "acme:E2", "acme:E3");
+	}
+
+	@Test
+	void aFailureInsideASegmentMarksOnlyTheEventsBeforeItAndSendsNothingAfterTheSegment() {
+		twoEventsEachForThreeEmployees();
+		SlowBroker broker = new SlowBroker("acme:E2");
+
+		var result = new OutboxRelay(pendingOutbox, broker, tx, 100, new SimpleMeterRegistry()).relayOnce();
+
+		assertThat(result.published()).isEqualTo(1);
+		assertThat(result.stoppedOnFailure()).isTrue();
+		// E3's first event was in flight with E2's and may have reached the broker; it stays
+		// unpublished and is sent again (consumers drop the duplicate). No second event of
+		// any employee was sent, so none can overtake E2's failed first event.
+		assertThat(broker.sentKeys).containsExactly("acme:E1", "acme:E2", "acme:E3");
+		List<Map<String, Object>> rows = jdbc.queryForList(
+				"SELECT aggregate_id, published_at IS NOT NULL AS published, attempts FROM outbox ORDER BY id");
+		assertThat(rows).extracting(row -> row.get("published")).containsExactly(true, false, false, false, false, false);
+		assertThat(rows.get(1)).containsEntry("attempts", 1);
 	}
 
 	@Test
