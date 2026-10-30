@@ -1,6 +1,10 @@
 rostersync:
   security:
     jwt-secret: test-only-signing-key-0123456789abcdefghijkl
+  outbox:
+    relay:
+      # Tests run the relay explicitly so they control exactly when events are published.
+      enabled: false
 
 spring:
   datasource:

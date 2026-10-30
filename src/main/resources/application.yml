@@ -29,6 +29,13 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 
+rostersync:
+  outbox:
+    topic: rostersync.employee-changes
+    batch-size: 100
+    poll-interval-ms: 200
+    max-backoff-ms: 10000
+
 logging:
   structured:
     # One JSON object per line; MDC values (traceId, tenantId, employeeId) become fields.
