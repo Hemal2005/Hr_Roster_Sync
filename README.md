@@ -275,8 +275,8 @@ _Pending._
 
 ## Monitoring — what on-call sees at 3 AM
 
-`docker compose up -d prometheus grafana` starts:
-- **Prometheus** on [localhost:9090](http://localhost:9090), scraping `/actuator/prometheus` every 15 s;
+`docker compose up --build --wait` (see [Run it](#run-it)) starts, next to the app:
+- **Prometheus** on [localhost:9090](http://localhost:9090), scraping the app's `/actuator/prometheus` every 15 s;
 - **Grafana** on [localhost:3000](http://localhost:3000), with the provisioned dashboard **HR Roster Sync** (anonymous view; `admin`/`admin` for local editing).
 
 The app exposes only `/actuator/health` (UP or DOWN, plus `/liveness` and `/readiness`) and `/actuator/prometheus`, both without a token. Labels are tenant ids, outcomes and codes, never personal data. In production both would sit behind the internal network.
@@ -333,6 +333,35 @@ Two in-process [Caffeine](https://github.com/ben-manes/caffeine) caches. Each in
 
 ## Performance and cost
 
+### HR event ingest under load
+
+[`loadtest/ingest.js`](loadtest/ingest.js) with k6 2.3.0 (`scripts/loadtest.sh`) against the compose stack. 20 virtual users each own 50 employees. Every request is a batch of 50 records: the first creates them, and each later one sends the next version of all 50 with a changed shift. So every record is a real change: row lock, version check, update, event log row and outbox row.
+
+| 60 s run | |
+|---|---|
+| Records applied | 352,350, all `APPLIED`, 0 failed requests |
+| Throughput | **5,858 records/s** (117 batches/s) |
+| Batch latency (50 records) | p50 **145 ms**, p90 226 ms, p95 290 ms, **p99 556 ms**, max 1.9 s |
+| Outbox during the run | peak 30,929 unsent events, oldest at most **6.6 s** old (alert at 60 s), empty 20 s after the run |
+| Booking-cancellation consumer lag | 0 |
+
+Three runs gave 7,541, 6,610 and 5,858 records/s; each run left about 400,000 more employees in the table. The numbers above are the last run.
+
+Machine: Apple M2 (8 cores), 8 GB RAM, macOS 27.0.1. Docker 28.1.1 with 8 CPUs and 6 GB. The app runs on Temurin 21.0.12 in its container; tests ran on Temurin 21.0.13. The app, Postgres, Redpanda, Prometheus, Grafana and k6 **all share this one laptop**, so these are lower bounds for a real deployment, not capacity figures.
+
+**What the load test found.** The first run pushed the outbox to 473,000 unsent events. The relay waited for the broker's acknowledgement of each event before sending the next, which gave **137 events/s** against 7,500 records/s coming in. It now sends a batch in segments where no employee repeats and waits for the acknowledgements together. That gives **7,138 events/s** on the same backlog, with the same ordering and failure rules ([`OutboxRelay`](src/main/java/com/moveinsync/rostersync/application/OutboxRelay.java)).
+
+### Cost of each path
+
+| Path | Time | Space | Stops scaling when |
+|---|---|---|---|
+| Apply one HR record | O(1): one indexed row lock, one update, two inserts; validation is O(fields), office lookup O(1) from cache | O(1) | Many writers on *one* employee serialise on its row lock (by design); otherwise Postgres write throughput |
+| Batch of n records | O(n) independent transactions | O(n) for the request and response | The request body: batches are capped at 1,000 |
+| Nightly diff | O(n + m) for n file rows and m stored rows | O(n / 64) heap, O(n) temp disk | Each bucket grows past a few thousand rows: raise `bucket-count` |
+| Safety brake | O(1) on the plan's counts | O(1) | — |
+| Relay | O(events), one broker round trip per segment of up to 100 | O(batch) | A single relay per database (advisory lock) is the ceiling, here ≈ 7,000 events/s; next step is partitioning the relay by key hash |
+| Deactivation side effect | O(bookings of that employee), one statement | O(1) | — |
+
 ### Nightly reconciliation at 200,000 employees
 
 [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java), run with `./mvnw verify -Pbenchmark`. The test JVM has a 256 MB heap (`-Xmx256m`); Postgres runs in Testcontainers on the same machine.
@@ -346,7 +375,7 @@ Two in-process [Caffeine](https://github.com/ben-manes/caffeine) caches. Each in
 | Planning + applying 2,995 changes | **25.3 s** (budget: 60 s) |
 | Peak heap, Spring context included | **109 MB** of 256 MB |
 
-Machine: Apple M2, 8 cores, 8 GB RAM, macOS, JDK 21.0.13 (Temurin), Docker with 6 GB.
+Machine: as above (tests on Temurin 21.0.13).
 
 - **Time.** Planning is O(n) in file rows plus stored rows: one streaming pass, then one indexed bucket query and an O(bucket) hash-map comparison per bucket. Applying is O(changes), one short transaction each. On a quiet night that is a few thousand changes, not 200,000.
 - **Space.** O(n / 64) in memory, for one bucket's file rows and stored rows, plus O(n) on disk for the temporary bucket files (about 16 MB for 200,000 rows). Doubling the client size doubles the disk use and the time, not the heap. Beyond a few million employees per client, `bucket-count` would be raised so that each bucket stays small.
@@ -537,23 +566,68 @@ Every error is an [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) problem doc
 
 ## Run it
 
-Prerequisites: JDK 21 and Docker. Maven is not required; the project ships with the Maven wrapper.
+### One command (Docker only)
 
 ```bash
-docker compose up -d postgres redpanda                 # Postgres 16 on :5432, Kafka-compatible Redpanda on :19092
-docker compose up -d prometheus grafana                # monitoring: Prometheus on :9090, Grafana on :3000 (dashboard "HR Roster Sync")
+docker compose up --build --wait
+```
+
+This builds the app image and starts five services. `--wait` returns once all of them report healthy, about 3 minutes on the first build and seconds afterwards.
+
+| Service | Address | What it is |
+|---|---|---|
+| `app` | http://localhost:8080 | The API, built from the [`Dockerfile`](Dockerfile), under the **`demo` profile** |
+| `postgres` | localhost:5432 | PostgreSQL 16 (database, user and password `rostersync`) |
+| `redpanda` | localhost:19092 | Kafka-compatible broker |
+| `prometheus` | http://localhost:9090 | Metrics and alert rules |
+| `grafana` | http://localhost:3000 | Dashboard "HR Roster Sync" (view anonymously; `admin`/`admin` to edit) |
+
+> **The `demo` profile is for local evaluation only, and it is off unless you ask for it.** It turns on `POST /dev/token`, which hands out a token for any tenant and role, and it loads demo data. Its signing key comes from `ROSTERSYNC_SECURITY_JWT_SECRET`, which defaults to a demo key in `docker-compose.yml`. A real deployment runs without `demo` or `dev`, provides its own key, and gets tokens from its identity provider.
+
+**Demo data** ([`R__demo_seed.sql`](src/main/resources/db/demo/R__demo_seed.sql)):
+- tenants `acme` (offices `BLR-01`, `HYD-02`, and `PUN-03`, which is inactive) and `globex` (`BLR-01`, `CHN-01`);
+- trips `T-ACME-1`, `T-ACME-2` and `T-GLOBEX-1` tomorrow, plus `T-ACME-OLD`, which already ran.
+Employees come in through the API, as in real life.
+
+**Demo users** are token identities; ask `/dev/token` for any of them:
+
+| Tenant | Subject | Role | Use |
+|---|---|---|---|
+| `acme` | `workday` | `HR_INTEGRATION` | send HR events, upload a nightly file |
+| `acme` | `admin-1` | `ADMIN` | read employees, edit transport fields, book trips |
+| `acme` | `ops-1` | `OPERATOR` | review, approve or reject nightly runs |
+| `acme` | `E000042` | `EMPLOYEE` | `GET /api/v1/employees/me` once E000042 exists |
+| `globex` | `workday` | `HR_INTEGRATION` | the second tenant, to see isolation |
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/dev/token -H 'Content-Type: application/json' \
+  -d '{"tenantId":"acme","subject":"workday","roles":["HR_INTEGRATION"]}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -X POST localhost:8080/api/v1/hr/events:batch -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"sourceSystem":"workday","events":[{"type":"CREATE","employeeId":"E000042","version":1,"occurredAt":"2026-10-30T08:00:00Z",
+       "firstName":"Asha","email":"asha@acme.example","phone":"+919876543210","officeCode":"BLR-01","shiftCode":"DAY"}]}'
+# {"results":[{"index":0,"employeeId":"E000042","outcome":"APPLIED"}]}
+```
+
+Stop it with `docker compose down`, which keeps the data; `docker compose down -v` also deletes the volumes.
+
+### Developing (JDK 21 + Docker)
+
+Maven is not required; the project ships with the Maven wrapper.
+
+```bash
+docker compose up -d postgres redpanda                 # only the database and broker
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev  # the API on localhost:8080, with a local-only signing key
 ./mvnw test                                            # unit tests, no Docker needed
-./mvnw verify                                          # unit + integration tests; each run starts its own Postgres
+./mvnw verify                                          # unit + integration tests; each test context starts its own Postgres and Redpanda
 ./mvnw verify -Pbenchmark                              # only the 200,000-employee reconciliation benchmark, 256 MB heap
 scripts/generate-export.sh --rows 200000               # a synthetic nightly export in data/generated/
 scripts/check-alerts.sh                                # validate the Prometheus config and unit-test the alert rules (Docker)
-docker compose down -v                                 # stop and delete the local database
+scripts/loadtest.sh                                    # k6 ingest load test against the compose app (Docker)
 ```
 
-The application refuses to start without a token signing key (`rostersync.security.jwt-secret`, at least 32 bytes). The `dev` profile supplies a local-only one; any real deployment must provide its own.
-
-Integration tests never use the `docker compose` services: they start their own Postgres and Redpanda through Testcontainers, so Docker must be running for `./mvnw verify`.
+- The application refuses to start without a token signing key (`rostersync.security.jwt-secret`, at least 32 bytes). The `dev` profile supplies a local-only one.
+- Prometheus scrapes the `app` container. To watch an app started with `spring-boot:run` instead, stop the container (`docker compose stop app`) and change the target in [`prometheus.yml`](ops/prometheus/prometheus.yml) to `host.docker.internal:8080`.
+- Integration tests never use the compose services: they start their own containers through Testcontainers, so Docker must be running for `./mvnw verify`. At most three test contexts (and their containers) are alive at a time ([`spring.properties`](src/test/resources/spring.properties)), so a full run fits in 6 GB of Docker memory next to the running stack.
 
 ## Project structure
 
