@@ -1,5 +1,7 @@
 package com.moveinsync.rostersync.support;
 
+import com.moveinsync.rostersync.application.LocalCache;
+import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -20,10 +22,14 @@ public abstract class IntegrationTest {
 	@Autowired
 	protected JdbcTemplate jdbc;
 
+	@Autowired
+	private List<LocalCache> caches;
+
 	@BeforeEach
 	void emptyTables() {
 		jdbc.execute("TRUNCATE reconciliation_error, reconciliation_item, reconciliation_run, processed_message, booking, "
 				+ "trip, outbox, employee_event_log, employee, office, tenant");
+		caches.forEach(LocalCache::invalidateAll);
 	}
 
 	protected void givenTenant(String tenantId, String... officeCodes) {

@@ -29,15 +29,19 @@ public class EmployeeService {
 	private final EmployeeRepository employees;
 	private final Outbox outbox;
 	private final TransactionTemplate tx;
+	private final EmployeeReadCache cache;
 
-	EmployeeService(EmployeeRepository employees, Outbox outbox, TransactionTemplate tx) {
+	EmployeeService(EmployeeRepository employees, Outbox outbox, TransactionTemplate tx, EmployeeReadCache cache) {
 		this.employees = employees;
 		this.outbox = outbox;
 		this.tx = tx;
+		this.cache = cache;
 	}
 
+	/** For display only: may be up to {@link EmployeeReadCache#TTL} old. Never pass it to a write. */
 	public Employee get(TenantId tenantId, EmployeeId employeeId) {
-		return employees.find(tenantId, employeeId).orElseThrow(() -> new DomainException(ErrorCode.NOT_FOUND));
+		return cache.get(tenantId, employeeId, () -> employees.find(tenantId, employeeId))
+				.orElseThrow(() -> new DomainException(ErrorCode.NOT_FOUND));
 	}
 
 	/**
@@ -47,7 +51,7 @@ public class EmployeeService {
 	 */
 	public Employee updateTransport(TenantId tenantId, EmployeeId employeeId, TransportChanges changes,
 			long expectedVersion) {
-		return tx.execute(status -> {
+		Employee updated = tx.execute(status -> {
 			Employee employee = employees.findForUpdate(tenantId, employeeId)
 					.orElseThrow(() -> new DomainException(ErrorCode.NOT_FOUND));
 			Set<EmployeeField> changed = employee.applyTransport(changes.applyTo(employee.transportFields()),
@@ -60,5 +64,7 @@ public class EmployeeService {
 					employee.transportVersion());
 			return employee;
 		});
+		cache.evict(tenantId, employeeId);
+		return updated;
 	}
 }

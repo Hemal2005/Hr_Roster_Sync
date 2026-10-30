@@ -51,16 +51,18 @@ public class ApplyService {
 	private final AppliedEventLog appliedEvents;
 	private final Outbox outbox;
 	private final TransactionTemplate tx;
+	private final EmployeeReadCache readCache;
 	private final VersionPolicy versionPolicy = new VersionPolicy();
 	private final PayloadHasher hasher = new PayloadHasher();
 
 	ApplyService(RecordValidator validator, EmployeeRepository employees, AppliedEventLog appliedEvents,
-			Outbox outbox, TransactionTemplate tx) {
+			Outbox outbox, TransactionTemplate tx, EmployeeReadCache readCache) {
 		this.validator = validator;
 		this.employees = employees;
 		this.appliedEvents = appliedEvents;
 		this.outbox = outbox;
 		this.tx = tx;
+		this.readCache = readCache;
 	}
 
 	public ApplyResult apply(TenantId tenantId, String sourceSystem, IncomingHrRecord record) {
@@ -70,6 +72,9 @@ public class ApplyService {
 		}
 		try {
 			ApplyResult result = validateAndApply(tenantId, sourceSystem, record);
+			if (result.outcome() == ApplyOutcome.APPLIED) {
+				readCache.evict(tenantId, new EmployeeId(record.employeeId()));
+			}
 			if (result.outcome() == ApplyOutcome.REJECTED) {
 				log.info("hr event rejected version={} code={}", record.version(), result.errorCode());
 			} else {
@@ -112,6 +117,9 @@ public class ApplyService {
 				return true;
 			});
 			log.info("missing from export: {}", Boolean.TRUE.equals(done) ? "deactivated" : "skipped, changed since plan");
+			if (Boolean.TRUE.equals(done)) {
+				readCache.evict(tenantId, employeeId);
+			}
 			return Boolean.TRUE.equals(done);
 		} finally {
 			MDC.remove("tenantId");

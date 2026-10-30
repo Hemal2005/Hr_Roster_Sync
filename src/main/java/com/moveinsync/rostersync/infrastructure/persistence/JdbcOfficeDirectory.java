@@ -3,13 +3,12 @@ package com.moveinsync.rostersync.infrastructure.persistence;
 import com.moveinsync.rostersync.domain.TenantId;
 import com.moveinsync.rostersync.domain.validation.OfficeDirectory;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Repository;
 
 /**
  * Office codes of one tenant, read straight from the database. An inactive office is
- * treated as unknown so new events cannot route employees to it.
+ * treated as unknown so new events cannot route employees to it. Used behind
+ * {@link CachingOfficeDirectory}.
  */
-@Repository
 class JdbcOfficeDirectory implements OfficeDirectory {
 
 	private final JdbcTemplate jdbc;
