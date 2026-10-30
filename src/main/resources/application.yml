@@ -11,3 +11,9 @@ spring:
     hibernate:
       # Flyway owns the schema; Hibernate only checks that its mapping matches.
       ddl-auto: validate
+
+logging:
+  structured:
+    # One JSON object per line; MDC values (traceId, tenantId, employeeId) become fields.
+    format:
+      console: logstash
