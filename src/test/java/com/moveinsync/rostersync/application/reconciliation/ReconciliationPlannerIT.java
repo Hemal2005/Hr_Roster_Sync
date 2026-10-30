@@ -108,6 +108,23 @@ class ReconciliationPlannerIT extends IntegrationTest {
 	}
 
 	@Test
+	void aLineWithTheWrongColumnCountIsReportedWithoutItsFirstFieldButStillCountsAsPresent() {
+		Path export = ExportFiles.write(dir, "acme", AS_OF, List.of(
+				active("E1", 1, "BLR-01", "DAY"), active("E2", 1, "BLR-01", "DAY"),
+				"E3,1,Priyanka",                            // line 5: cut short, but starts with E3
+				"Priyanka,e9@acme.example",                 // line 6: garbled, starts with a name
+				active("E4", 5, "BLR-01", "DAY")), true);
+		UUID runId = newRun();
+
+		PlanSummary summary = planner.plan(runId, ACME, AS_OF, export);
+
+		assertThat(store.errors(ACME, runId, 0, 100)).containsExactly(
+				new RunError(5, null, ErrorCode.MALFORMED_RECORD),
+				new RunError(6, null, ErrorCode.MALFORMED_RECORD));
+		assertThat(summary.toDeactivate()).as("E3's cut-off line still marks E3 present").isZero();
+	}
+
+	@Test
 	void sameVersionDifferentContentIsReportedAsAConflict() {
 		Path export = ExportFiles.write(dir, "acme", AS_OF, List.of(
 				active("E1", 1, "HYD-02", "DAY"), active("E2", 1, "BLR-01", "DAY"),

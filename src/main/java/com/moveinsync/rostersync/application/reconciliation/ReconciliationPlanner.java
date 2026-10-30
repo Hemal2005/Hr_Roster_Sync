@@ -131,7 +131,10 @@ public class ReconciliationPlanner {
 				@Override
 				public void malformed(long lineNo, String employeeId, ErrorCode code) {
 					invalid[0]++;
-					errors.add(new RunError(lineNo, employeeId, code));
+					// A line with the wrong number of columns may not start with an id at all
+					// (a shifted or garbled row can start with a name), so its first field is
+					// never reported. It still marks that id present below.
+					errors.add(new RunError(lineNo, code == ErrorCode.MALFORMED_RECORD ? null : employeeId, code));
 					if (employeeId != null) {
 						// Still present in the file: this employee must not be deactivated.
 						write(writers, work, employeeId, employeeId, "0", "", "", INVALID, Long.toString(lineNo));
