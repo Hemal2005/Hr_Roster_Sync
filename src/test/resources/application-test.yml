@@ -1,3 +1,10 @@
 rostersync:
   security:
     jwt-secret: test-only-signing-key-0123456789abcdefghijkl
+
+spring:
+  datasource:
+    hikari:
+      # More connections than ConcurrentApplyIT's 32 threads, so they really reach the
+      # database at the same time instead of queueing for a connection.
+      maximum-pool-size: 40
