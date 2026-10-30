@@ -65,6 +65,19 @@ class ExportGeneratorTest {
 	}
 
 	@Test
+	void changedRowsMoveToVersionTwoAndSkippedRowsAreLeftOut() throws Exception {
+		Path file = ExportGenerator.write(dir.resolve("mix.csv"), "acme", ExportGenerator.DEFAULT_AS_OF, 1000, null,
+				ExportGenerator.DEFAULT_OFFICES, 10, 100);
+
+		Read read = read(file);
+
+		assertThat(read.ids()).hasSize(990).doesNotContain("E000100", "E001000").contains("E000010");
+		assertThat(read.ending().trailerMatches()).isTrue();
+		assertThat(Files.readAllLines(file)).anySatisfy(line -> assertThat(line).startsWith("E000010,2,"))
+				.anySatisfy(line -> assertThat(line).startsWith("E000011,1,"));
+	}
+
+	@Test
 	void sameArgumentsWriteTheSameBytes() throws Exception {
 		Path a = ExportGenerator.write(dir.resolve("a.csv"), "acme", ExportGenerator.DEFAULT_AS_OF, 500, null,
 				ExportGenerator.DEFAULT_OFFICES);

@@ -20,6 +20,10 @@
 		<libphonenumber.version>9.0.42</libphonenumber.version>
 		<commons-csv.version>1.14.1</commons-csv.version>
 		<archunit.version>1.5.1</archunit.version>
+		<!-- Integration test selection; the benchmark profile below overrides these -->
+		<it.groups></it.groups>
+		<it.excludedGroups>benchmark</it.excludedGroups>
+		<it.argLine></it.argLine>
 	</properties>
 
 	<dependencies>
@@ -188,6 +192,11 @@
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-failsafe-plugin</artifactId>
+				<configuration>
+					<groups>${it.groups}</groups>
+					<excludedGroups>${it.excludedGroups}</excludedGroups>
+					<argLine>${it.argLine}</argLine>
+				</configuration>
 				<executions>
 					<execution>
 						<goals>
@@ -199,5 +208,28 @@
 			</plugin>
 		</plugins>
 	</build>
+
+	<profiles>
+		<!-- ./mvnw verify -Pbenchmark: only @Tag("benchmark") tests, on a 256 MB heap -->
+		<profile>
+			<id>benchmark</id>
+			<properties>
+				<it.groups>benchmark</it.groups>
+				<it.excludedGroups></it.excludedGroups>
+				<it.argLine>-Xmx256m</it.argLine>
+			</properties>
+			<build>
+				<plugins>
+					<plugin>
+						<groupId>org.apache.maven.plugins</groupId>
+						<artifactId>maven-surefire-plugin</artifactId>
+						<configuration>
+							<skipTests>true</skipTests>
+						</configuration>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+	</profiles>
 
 </project>

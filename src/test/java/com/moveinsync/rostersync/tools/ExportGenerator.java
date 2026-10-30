@@ -45,6 +45,11 @@ public final class ExportGenerator {
 
 	/** The row for employee {@code n} at {@code version}, in {@link #COLUMNS} order. */
 	public static List<String> fields(String tenant, int n, long version, List<String> offices) {
+		return fields(tenant, n, version, offices, 0);
+	}
+
+	/** As above; {@code shiftShift} rotates the shift, which is how a changed row differs. */
+	private static List<String> fields(String tenant, int n, long version, List<String> offices, int shiftShift) {
 		String id = employeeId(n);
 		return List.of(
 				id,
@@ -55,7 +60,7 @@ public final class ExportGenerator {
 				"+9198" + "%08d".formatted(n),
 				employeeId(n == 1 ? 2 : 1),
 				offices.get(n % offices.size()),
-				SHIFTS[n % SHIFTS.length],
+				SHIFTS[(n + shiftShift) % SHIFTS.length],
 				"ACTIVE");
 	}
 
@@ -65,8 +70,18 @@ public final class ExportGenerator {
 	 */
 	public static Path write(Path out, String tenant, Instant asOf, int rows, Integer truncateAt,
 			List<String> offices) {
+		return write(out, tenant, asOf, rows, truncateAt, offices, 0, 0);
+	}
+
+	/**
+	 * As above, and also: every {@code changedEvery}-th employee is at version 2 with another
+	 * shift, and every {@code skipEvery}-th employee is left out (0 turns either off).
+	 */
+	public static Path write(Path out, String tenant, Instant asOf, int rows, Integer truncateAt,
+			List<String> offices, int changedEvery, int skipEvery) {
 		int whole = truncateAt == null ? rows : Math.min(rows, truncateAt);
 		boolean truncated = whole < rows;
+		long written = 0;
 		try {
 			if (out.getParent() != null) {
 				Files.createDirectories(out.getParent());
@@ -75,14 +90,19 @@ public final class ExportGenerator {
 				writer.write("#HEADER,tenant=" + tenant + ",as_of=" + asOf + "\n");
 				writer.write(COLUMNS + "\n");
 				for (int n = 1; n <= whole; n++) {
-					writer.write(String.join(",", fields(tenant, n, 1, offices)));
+					if (skipEvery > 0 && n % skipEvery == 0) {
+						continue;
+					}
+					boolean changed = changedEvery > 0 && n % changedEvery == 0;
+					writer.write(String.join(",", fields(tenant, n, changed ? 2 : 1, offices, changed ? 1 : 0)));
 					writer.write('\n');
+					written++;
 				}
 				if (truncated) {
 					String next = String.join(",", fields(tenant, whole + 1, 1, offices));
 					writer.write(next, 0, next.length() / 2);
 				} else {
-					writer.write("#TRAILER,count=" + rows + "\n");
+					writer.write("#TRAILER,count=" + written + "\n");
 				}
 			}
 			return out;
@@ -106,17 +126,20 @@ public final class ExportGenerator {
 		Instant asOf = Instant.parse(options.getOrDefault("as-of", DEFAULT_AS_OF.toString()));
 		List<String> offices = options.containsKey("offices") ? List.of(options.get("offices").split(","))
 				: DEFAULT_OFFICES;
+		int changedEvery = Integer.parseInt(options.getOrDefault("changed-every", "0"));
+		int skipEvery = Integer.parseInt(options.getOrDefault("skip-every", "0"));
 		Path out = Path.of(options.getOrDefault("out", "data/generated/export-" + tenant + "-" + rows + ".csv"));
 
 		long started = System.nanoTime();
-		write(out, tenant, asOf, rows, truncateAt, offices);
-		System.out.printf("wrote %s (%d rows%s) in %d ms%n", out, truncateAt == null ? rows : Math.min(rows, truncateAt),
+		write(out, tenant, asOf, rows, truncateAt, offices, changedEvery, skipEvery);
+		System.out.printf("wrote %s (up to E%06d%s) in %d ms%n", out, truncateAt == null ? rows : Math.min(rows, truncateAt),
 				truncateAt != null && truncateAt < rows ? ", truncated, no trailer" : "",
 				(System.nanoTime() - started) / 1_000_000);
 	}
 
 	private static void usage() {
 		System.err.println("usage: generate-export.sh [--tenant acme] [--rows 200000] [--truncate-at N] "
-				+ "[--as-of 2026-10-30T02:00:00Z] [--offices BLR-01,HYD-02] [--out data/generated/x.csv]");
+				+ "[--changed-every K] [--skip-every M] [--as-of 2026-10-30T02:00:00Z] "
+				+ "[--offices BLR-01,HYD-02] [--out data/generated/x.csv]");
 	}
 }
