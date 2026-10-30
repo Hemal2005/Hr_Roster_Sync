@@ -121,7 +121,45 @@ Each rule from the case study: what it says, what goes wrong without it, how it 
   - The domain `toString` tests.
   - A test that captures every log line of the whole suite comes with the monitoring work.
 
-_Nightly reconciliation, the safety brake, the outbox and deactivation side effects are described as they are built._
+### Reliable change events (the outbox)
+
+- **The rule.** Publish a change event for every applied change using the outbox pattern, so the database update and the event can never disagree.
+- **Without it.** The obvious code saves the employee and then sends the event. If the process dies in between, the employee is marked as left but nobody downstream hears about it, and their cab bookings stay. Sending first and saving second fails the other way: an event for a change that was rolled back.
+- **How.**
+  - In **the same database transaction** as the employee update, a row is written to the `outbox` table ([`ApplyService`](src/main/java/com/moveinsync/rostersync/application/ApplyService.java), [`JdbcOutbox`](src/main/java/com/moveinsync/rostersync/infrastructure/persistence/JdbcOutbox.java)). Both commit or neither does, and the outbox refuses a write outside a transaction.
+  - A background relay ([`OutboxRelay`](src/main/java/com/moveinsync/rostersync/application/OutboxRelay.java)) runs every 200 ms:
+    - it locks up to 100 unsent rows in order (`FOR UPDATE SKIP LOCKED`);
+    - it sends each to the topic `rostersync.employee-changes`, keyed by `tenant:employee` so each employee's events stay in order;
+    - it **waits for the broker's acknowledgement** before marking the row sent.
+  - On a failure it records the attempt, **stops the batch** so no later event overtakes an earlier one, and backs off exponentially, up to 10 s.
+  - A Postgres advisory lock keeps exactly one relay active across instances. Skipping locked rows alone would let a second instance send an employee's newer event while the first retries an older one.
+  - Events carry ids, versions, status and the *names* of the changed fields, never their values. A consumer that needs details asks the API.
+- **Why this way.**
+  - Delivery is **at least once**: a crash after sending but before marking means the event is sent again.
+  - Consumers turn that into an **exactly-once effect** by remembering event ids.
+  - Exactly-once *delivery* across a database and a broker would need a distributed transaction. Reading the database's change log (CDC, e.g. Debezium) would avoid polling but adds a connector service to run.
+- **Proof.**
+  - [`OutboxIT.eventWrittenInSameTransaction`](src/test/java/com/moveinsync/rostersync/OutboxIT.java): a failing event write leaves no employee change behind. The same class shows duplicates and stale records write no event.
+  - [`OutboxRelayIT`](src/test/java/com/moveinsync/rostersync/application/OutboxRelayIT.java): order per key, stop at the first failure, one active relay.
+  - [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java): **the process dies between the database write and the publish**, both before and after the broker received the event, and the effect still happens exactly once.
+  - [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java): while the broker is down, updates keep being accepted and the backlog drains in order afterwards.
+
+### Deactivation side effects
+
+- **The rule.** An employee who leaves has their future cab bookings cancelled and their seat freed.
+- **Without it.** A cab waits at the pickup point of someone who no longer works there, and the seat cannot be given to anyone else.
+- **How.**
+  - A consumer of the change topic ([`EmployeeChangeListener`](src/main/java/com/moveinsync/rostersync/infrastructure/messaging/EmployeeChangeListener.java) → [`DeactivationHandler`](src/main/java/com/moveinsync/rostersync/application/DeactivationHandler.java)) reacts to `EMPLOYEE_DEACTIVATED`.
+  - In one transaction it records the event id in `processed_message`. If the id is already there, it does nothing.
+  - Otherwise it cancels the employee's bookings on trips that have not started and frees one seat per cancelled booking. Both happen in a single SQL statement, so they cannot get out of step.
+  - Bookings on trips that already ran are left as history.
+  - A failing side effect is retried with growing pauses for up to ten minutes.
+- **Why the event id check matters.** Cancelling is mostly idempotent on its own, since a second run finds nothing still booked. The dangerous case is a **late copy** of an old exit that arrives after the person was rehired and booked again. Without the check it would cancel the new booking.
+- **Proof.**
+  - [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java), including `lateCopyOfAnOldExitDoesNotCancelBookingsMadeAfterRehire`. That test fails if the check is removed.
+  - [`BookingApiIT.anExitSentByHrCancelsTheBookingEndToEnd`](src/test/java/com/moveinsync/rostersync/api/booking/BookingApiIT.java).
+
+_Nightly reconciliation and the safety brake are described as they are built._
 
 ## Design decisions
 
@@ -312,6 +350,25 @@ Content-Type: application/json
 - `428 PRECONDITION_REQUIRED` without `If-Match`, and `412 TRANSPORT_VERSION_MISMATCH` if someone else edited first. Nothing changes in either case.
 - `400 FIELD_NOT_OWNED` if the body names an HR-owned field (such as `officeCode`), and `400 INVALID_REQUEST` for an unknown field. Both list the field names.
 
+### `POST /api/v1/bookings` and `GET /api/v1/bookings?employeeId=` (ADMIN)
+
+These are minimal, there to show what an exit does to bookings.
+- `POST {"tripId":"T1","employeeId":"E000042"}` → `201` with the booking.
+- `409` when the trip is full (`TRIP_FULL`), already departed (`TRIP_DEPARTED`), the employee is inactive (`EMPLOYEE_INACTIVE`), or the employee already holds a seat on it (`ALREADY_BOOKED`).
+- `404` for an unknown trip or employee, or one in another tenant.
+- `GET` lists the employee's bookings with status and cancel reason.
+
+### Change events (topic `rostersync.employee-changes`)
+
+Key: `tenant:employee`. Headers: `eventId`, `eventType`. Value:
+```json
+{ "eventId": "41dd…", "tenantId": "acme", "employeeId": "E000042", "type": "EMPLOYEE_DEACTIVATED",
+  "status": "INACTIVE", "hrVersion": 12, "transportVersion": 3, "changedFields": ["status"],
+  "occurredAt": "2026-10-30T09:00:00Z" }
+```
+- `type` is one of `EMPLOYEE_CREATED`, `EMPLOYEE_UPDATED`, `EMPLOYEE_DEACTIVATED`, `EMPLOYEE_REACTIVATED` or `TRANSPORT_UPDATED`.
+- Delivery is at least once, so consumers must ignore an `eventId` they have already handled.
+
 ### `POST /dev/token` (only under the `dev` / `demo` profiles)
 
 ```bash
@@ -334,7 +391,7 @@ Every error is an [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) problem doc
 Prerequisites: JDK 21 and Docker. Maven is not required; the project ships with the Maven wrapper.
 
 ```bash
-docker compose up -d postgres                          # Postgres 16 on localhost:5432 (local-only credentials)
+docker compose up -d postgres redpanda                 # Postgres 16 on :5432, Kafka-compatible Redpanda on :19092
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev  # the API on localhost:8080, with a local-only signing key
 ./mvnw test                                            # unit tests, no Docker needed
 ./mvnw verify                                          # unit + integration tests; each run starts its own Postgres
@@ -343,7 +400,7 @@ docker compose down -v                                 # stop and delete the loc
 
 The application refuses to start without a token signing key (`rostersync.security.jwt-secret`, at least 32 bytes). The `dev` profile supplies a local-only one; any real deployment must provide its own.
 
-Integration tests never use the `docker compose` database: they start a separate Postgres through Testcontainers, so Docker must be running for `./mvnw verify`.
+Integration tests never use the `docker compose` services: they start their own Postgres and Redpanda through Testcontainers, so Docker must be running for `./mvnw verify`.
 
 ## Project structure
 
