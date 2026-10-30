@@ -1,6 +1,7 @@
 package com.moveinsync.rostersync;
 
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
@@ -21,6 +22,14 @@ class ArchitectureTest {
 						"com.moveinsync.rostersync.domain..",
 						"com.google.i18n.phonenumbers..")
 				.because("core rules must be testable without a web server, database or broker")
+				.check(PRODUCTION_CLASSES);
+	}
+
+	@Test
+	void domainNeverReachesIntoInfrastructure() {
+		noClasses().that().resideInAPackage("..domain..")
+				.should().dependOnClassesThat().resideInAPackage("..infrastructure..")
+				.because("infrastructure implements domain ports, never the other way round")
 				.check(PRODUCTION_CLASSES);
 	}
 }

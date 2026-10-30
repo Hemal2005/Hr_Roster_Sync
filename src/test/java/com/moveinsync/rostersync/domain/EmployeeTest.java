@@ -101,6 +101,28 @@ class EmployeeTest {
 	}
 
 	@Test
+	void restoreRebuildsEveryStoredValue() {
+		var transport = new TransportOwnedFields("Gate 2", null);
+		Employee employee = Employee.restore(TestEvents.TENANT, TestEvents.EMPLOYEE, TestEvents.fields("BLR-01", "DAY"),
+				EmployeeStatus.INACTIVE, 9, hash(9), TestEvents.T0, transport, 3);
+
+		assertThat(employee.status()).isEqualTo(EmployeeStatus.INACTIVE);
+		assertThat(employee.hrVersion()).isEqualTo(9);
+		assertThat(employee.transportFields()).isEqualTo(transport);
+		assertThat(employee.transportVersion()).isEqualTo(3);
+	}
+
+	@Test
+	void restoreRefusesImpossibleStoredVersions() {
+		assertThatThrownBy(() -> Employee.restore(TestEvents.TENANT, TestEvents.EMPLOYEE,
+				TestEvents.fields("BLR-01", "DAY"), EmployeeStatus.ACTIVE, 0, hash(1), TestEvents.T0,
+				TransportOwnedFields.NONE, 0)).isInstanceOf(IllegalArgumentException.class);
+		assertThatThrownBy(() -> Employee.restore(TestEvents.TENANT, TestEvents.EMPLOYEE,
+				TestEvents.fields("BLR-01", "DAY"), EmployeeStatus.ACTIVE, 1, hash(1), TestEvents.T0,
+				TransportOwnedFields.NONE, -1)).isInstanceOf(IllegalArgumentException.class);
+	}
+
+	@Test
 	void toStringContainsNoPersonalData() {
 		Employee employee = Employee.createFrom(create(1, "BLR-01", "MORNING"), hash(1));
 

@@ -49,6 +49,28 @@ public final class Employee {
 	}
 
 	/**
+	 * Rebuilds an employee from storage. Not for new employees: those come from
+	 * {@link #createFrom}.
+	 */
+	public static Employee restore(TenantId tenantId, EmployeeId employeeId, HrOwnedFields hrFields,
+			EmployeeStatus status, long hrVersion, PayloadHash hrPayloadHash, Instant lastHrEventAt,
+			TransportOwnedFields transportFields, long transportVersion) {
+		Employee employee = new Employee(Objects.requireNonNull(tenantId, "tenantId"),
+				Objects.requireNonNull(employeeId, "employeeId"));
+		if (hrVersion < 1 || transportVersion < 0) {
+			throw new IllegalArgumentException("stored versions out of range");
+		}
+		employee.hrFields = Objects.requireNonNull(hrFields, "hrFields");
+		employee.status = Objects.requireNonNull(status, "status");
+		employee.hrVersion = hrVersion;
+		employee.hrPayloadHash = Objects.requireNonNull(hrPayloadHash, "hrPayloadHash");
+		employee.lastHrEventAt = Objects.requireNonNull(lastHrEventAt, "lastHrEventAt");
+		employee.transportFields = Objects.requireNonNull(transportFields, "transportFields");
+		employee.transportVersion = transportVersion;
+		return employee;
+	}
+
+	/**
 	 * Applies a newer HR event and returns the names of the fields it changed.
 	 */
 	public Set<EmployeeField> applyHr(HrEvent event, PayloadHash hash) {
