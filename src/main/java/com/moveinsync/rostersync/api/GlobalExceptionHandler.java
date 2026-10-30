@@ -15,6 +15,8 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.support.MissingServletRequestPartException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
@@ -61,6 +63,18 @@ public class GlobalExceptionHandler {
 		ProblemDetail problem = Problems.of(HttpStatus.BAD_REQUEST, ErrorCode.INVALID_REQUEST);
 		problem.setProperty("fields", List.of(e.getParameterName()));
 		return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(problem);
+	}
+
+	@ExceptionHandler(MissingServletRequestPartException.class)
+	ResponseEntity<ProblemDetail> missingPart(MissingServletRequestPartException e) {
+		ProblemDetail problem = Problems.of(HttpStatus.BAD_REQUEST, ErrorCode.INVALID_REQUEST);
+		problem.setProperty("fields", List.of(e.getRequestPartName()));
+		return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(problem);
+	}
+
+	@ExceptionHandler(MaxUploadSizeExceededException.class)
+	ResponseEntity<ProblemDetail> tooLarge(MaxUploadSizeExceededException e) {
+		return respond(HttpStatus.CONTENT_TOO_LARGE, ErrorCode.UPLOAD_TOO_LARGE);
 	}
 
 	@ExceptionHandler(NoResourceFoundException.class)

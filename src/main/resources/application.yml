@@ -11,6 +11,11 @@ spring:
     hibernate:
       # Flyway owns the schema; Hibernate only checks that its mapping matches.
       ddl-auto: validate
+  servlet:
+    multipart:
+      # A 200,000-row export is roughly 25 MB.
+      max-file-size: 100MB
+      max-request-size: 100MB
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
     producer:
