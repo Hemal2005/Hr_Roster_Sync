@@ -133,7 +133,48 @@ _Pending._
 
 ## Security and tenant isolation
 
-_Pending._
+Every request carries a signed token (a JWT: a small JSON document signed with a key only the server holds, so it cannot be forged or altered). The token says who is calling, which client (tenant) they belong to, and which roles they have.
+
+### Roles
+
+| Role | Who | May call |
+|---|---|---|
+| `HR_INTEGRATION` | The client's HR system (a machine, not a person) | `POST /api/v1/hr/events:batch` |
+| `ADMIN` | MoveInSync transport admin | `GET /api/v1/employees/{id}`, `PATCH /api/v1/employees/{id}/transport` |
+| `EMPLOYEE` | An employee | `GET /api/v1/employees/me` (own record only; the id is the token's subject) |
+| `OPERATOR` | Reviews nightly reconciliation runs | the reconciliation endpoints, when they exist |
+
+- Everything not listed is **denied by default**: a new endpoint is closed until someone decides who may use it.
+- `HR_INTEGRATION` is an addition to the case study's three roles. The HR system is not a person, and giving it `ADMIN` would let it edit transport fields.
+- Refusals are problem documents: `401 UNAUTHENTICATED` for a missing, expired, forged or tenant-less token; `403 FORBIDDEN` for the wrong role.
+
+### How the tenant is decided
+
+**Only from the verified token's `tenant_id` claim.** Never from the URL, the body or a header.
+- Controllers receive the tenant as a typed parameter that only the token can fill, so there is no code path that reads it from the request.
+- Every table's key starts with `tenant_id`, and every storage method requires the tenant.
+- An employee's office must belong to the same tenant (a composite foreign key).
+
+### Why another tenant's data answers 404, not 403
+
+`403 Forbidden` would confirm that the record exists, just not for you. That alone leaks information, for example whether a competitor employs someone with a given id. A request for another tenant's employee gets exactly the same `404` body as a request for an id that exists nowhere.
+
+Proof: [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java), and in it `anotherTenantsEmployeeLooksExactlyLikeAMissingOne`.
+
+### Personal data
+
+| Data | Stored in | Never appears in |
+|---|---|---|
+| Name, email, phone, manager | `employee` (HR-owned columns) | logs, error responses, metric labels, the batch report |
+| Pickup point (a home location), special-assistance needs (possibly health data) | `employee` (transport-owned columns) | the same, and HR write paths |
+
+These fields are returned only to an authorised caller: an `ADMIN` of the same tenant, or the employee themself.
+
+### Tokens and keys
+
+- Tokens are HS256-signed with `rostersync.security.jwt-secret`. The application refuses to start without it.
+- `POST /dev/token` issues tokens for local evaluation. It exists **only** under the `dev` and `demo` profiles, logs a warning when enabled, and returns `404` everywhere else.
+- A production deployment would use RS256 tokens from the company's identity provider, so the API holds only a public key. That is listed under "Deliberately left out".
 
 ## Failure handling
 
@@ -251,6 +292,33 @@ Response `200`:
 - `UNKNOWN_OFFICE`
 - `UNKNOWN_EMPLOYEE`
 - `VERSION_CONFLICT`
+
+### `GET /api/v1/employees/{id}` (ADMIN) and `GET /api/v1/employees/me` (EMPLOYEE)
+
+These return the employee record. The `ETag` header carries the transport version (`"0"`, `"1"`, …), which a transport edit must send back. An id that is not in the caller's tenant answers `404`.
+
+### `PATCH /api/v1/employees/{id}/transport` (ADMIN)
+
+```http
+PATCH /api/v1/employees/E000042/transport
+If-Match: "0"
+Content-Type: application/json
+
+{ "pickupPoint": "Gate 2, Tech Park" }
+```
+
+- `200` with the updated record and `ETag: "1"`.
+- A field left out keeps its value; a field sent as `null` is cleared.
+- `428 PRECONDITION_REQUIRED` without `If-Match`, and `412 TRANSPORT_VERSION_MISMATCH` if someone else edited first. Nothing changes in either case.
+- `400 FIELD_NOT_OWNED` if the body names an HR-owned field (such as `officeCode`), and `400 INVALID_REQUEST` for an unknown field. Both list the field names.
+
+### `POST /dev/token` (only under the `dev` / `demo` profiles)
+
+```bash
+curl -s -X POST localhost:8080/dev/token -H 'Content-Type: application/json' \
+  -d '{"tenantId":"acme","subject":"workday","roles":["HR_INTEGRATION"]}'
+# {"token":"eyJ…","expiresAt":"…"}
+```
 
 ### Errors
 
