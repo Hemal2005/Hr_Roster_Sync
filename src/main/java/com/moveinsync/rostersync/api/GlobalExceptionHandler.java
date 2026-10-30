@@ -12,6 +12,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
@@ -52,6 +53,13 @@ public class GlobalExceptionHandler {
 				.sorted()
 				.toList();
 		problem.setProperty("fields", fields);
+		return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(problem);
+	}
+
+	@ExceptionHandler(MissingServletRequestParameterException.class)
+	ResponseEntity<ProblemDetail> missingParameter(MissingServletRequestParameterException e) {
+		ProblemDetail problem = Problems.of(HttpStatus.BAD_REQUEST, ErrorCode.INVALID_REQUEST);
+		problem.setProperty("fields", List.of(e.getParameterName()));
 		return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(problem);
 	}
 

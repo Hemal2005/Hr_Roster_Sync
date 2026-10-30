@@ -41,6 +41,8 @@ class SecurityConfig implements WebMvcConfigurer {
 						.requestMatchers(HttpMethod.GET, "/api/v1/employees/me").hasRole(Role.EMPLOYEE.name())
 						.requestMatchers(HttpMethod.GET, "/api/v1/employees/*").hasRole(Role.ADMIN.name())
 						.requestMatchers(HttpMethod.PATCH, "/api/v1/employees/*/transport").hasRole(Role.ADMIN.name())
+						.requestMatchers(HttpMethod.POST, "/api/v1/bookings").hasRole(Role.ADMIN.name())
+						.requestMatchers(HttpMethod.GET, "/api/v1/bookings").hasRole(Role.ADMIN.name())
 						// Only mapped under the dev and demo profiles; elsewhere it is a 404.
 						.requestMatchers(HttpMethod.POST, "/dev/token").permitAll()
 						.requestMatchers("/error").permitAll()

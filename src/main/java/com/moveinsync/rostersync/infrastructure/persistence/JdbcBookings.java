@@ -6,6 +6,8 @@ import com.moveinsync.rostersync.domain.TenantId;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Optional;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -39,10 +41,66 @@ class JdbcBookings implements Bookings {
 				    RETURNING trip.id
 				)
 				SELECT count(*) FROM cancelled
-				""", new MapSqlParameterSource()
-				.addValue("tenantId", tenantId.value())
-				.addValue("employeeId", employeeId.value())
-				.addValue("now", OffsetDateTime.ofInstant(now, ZoneOffset.UTC)), Integer.class);
+				""", params(tenantId).addValue("employeeId", employeeId.value()).addValue("now", utc(now)),
+				Integer.class);
 		return cancelled == null ? 0 : cancelled;
+	}
+
+	@Override
+	public Optional<Trip> lockTrip(TenantId tenantId, String tripId) {
+		return jdbc.query("""
+				SELECT id, pickup_time, capacity, seats_booked FROM trip
+				WHERE tenant_id = :tenantId AND id = :tripId
+				FOR UPDATE
+				""", params(tenantId).addValue("tripId", tripId), (rs, row) -> new Trip(
+				rs.getString("id"),
+				rs.getObject("pickup_time", OffsetDateTime.class).toInstant(),
+				rs.getInt("capacity"),
+				rs.getInt("seats_booked"))).stream().findFirst();
+	}
+
+	@Override
+	public boolean hasLiveBooking(TenantId tenantId, String tripId, EmployeeId employeeId) {
+		return Boolean.TRUE.equals(jdbc.queryForObject("""
+				SELECT EXISTS (SELECT 1 FROM booking WHERE tenant_id = :tenantId AND trip_id = :tripId
+				               AND employee_id = :employeeId AND status = 'BOOKED')
+				""", params(tenantId).addValue("tripId", tripId).addValue("employeeId", employeeId.value()),
+				Boolean.class));
+	}
+
+	@Override
+	public void addBooking(TenantId tenantId, String bookingId, String tripId, EmployeeId employeeId) {
+		var params = params(tenantId).addValue("bookingId", bookingId).addValue("tripId", tripId)
+				.addValue("employeeId", employeeId.value());
+		jdbc.update("""
+				INSERT INTO booking (tenant_id, id, trip_id, employee_id, status)
+				VALUES (:tenantId, :bookingId, :tripId, :employeeId, 'BOOKED')
+				""", params);
+		jdbc.update("UPDATE trip SET seats_booked = seats_booked + 1 WHERE tenant_id = :tenantId AND id = :tripId",
+				params);
+	}
+
+	@Override
+	public List<Booking> forEmployee(TenantId tenantId, EmployeeId employeeId) {
+		return jdbc.query("""
+				SELECT b.id, b.trip_id, b.employee_id, b.status, b.cancel_reason, t.pickup_time
+				FROM booking b JOIN trip t ON t.tenant_id = b.tenant_id AND t.id = b.trip_id
+				WHERE b.tenant_id = :tenantId AND b.employee_id = :employeeId
+				ORDER BY t.pickup_time
+				""", params(tenantId).addValue("employeeId", employeeId.value()), (rs, row) -> new Booking(
+				rs.getString("id"),
+				rs.getString("trip_id"),
+				rs.getString("employee_id"),
+				rs.getString("status"),
+				rs.getString("cancel_reason"),
+				rs.getObject("pickup_time", OffsetDateTime.class).toInstant()));
+	}
+
+	private static MapSqlParameterSource params(TenantId tenantId) {
+		return new MapSqlParameterSource().addValue("tenantId", tenantId.value());
+	}
+
+	private static OffsetDateTime utc(Instant instant) {
+		return OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
 	}
 }
