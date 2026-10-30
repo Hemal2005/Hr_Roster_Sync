@@ -123,6 +123,24 @@ class DeactivationConsumerIT extends IntegrationTest {
 	}
 
 	@Test
+	void lateCopyOfAnOldExitDoesNotCancelBookingsMadeAfterRehire() {
+		applyService.apply(ACME, "workday", deactivate("E000042", 2));
+		ChangeEvent oldExit = lastEvent();
+		relay.relayOnce();
+		awaitHandled(oldExit);
+		applyService.apply(ACME, "workday", update("E000042", 3, "BLR-01", "DAY"));
+		booking("B5", "T-TOMORROW", "E000042");
+		jdbc.update("UPDATE trip SET seats_booked = seats_booked + 1 WHERE id = 'T-TOMORROW'");
+
+		// Without the event id check this would cancel the rehired employee's new seat.
+		int cancelled = handler.handle(oldExit);
+
+		assertThat(cancelled).isZero();
+		assertThat(status("B5")).isEqualTo("BOOKED");
+		assertThat(seats("T-TOMORROW")).isEqualTo(2);
+	}
+
+	@Test
 	void otherChangesCancelNothing() {
 		applyService.apply(ACME, "workday", update("E000042", 2, "BLR-01", "NIGHT"));
 
