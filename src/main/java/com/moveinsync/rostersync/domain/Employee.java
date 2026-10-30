@@ -116,6 +116,22 @@ public final class Employee {
 	}
 
 	/**
+	 * The nightly export no longer lists this employee. They become INACTIVE at their
+	 * current HR version: no HR event carries a newer one. {@code inactiveStateHash} is
+	 * the hash of the resulting state, so a later resend of the same version reads as a
+	 * conflict rather than silently reactivating them.
+	 */
+	public Set<EmployeeField> deactivateAsMissingFromExport(PayloadHash inactiveStateHash) {
+		Objects.requireNonNull(inactiveStateHash, "inactiveStateHash");
+		if (status == EmployeeStatus.INACTIVE) {
+			return Set.of();
+		}
+		status = EmployeeStatus.INACTIVE;
+		hrPayloadHash = inactiveStateHash;
+		return Set.of(EmployeeField.STATUS);
+	}
+
+	/**
 	 * Replaces the transport-owned fields if {@code expectedVersion} matches the stored
 	 * transport version (optimistic check, like an HTTP If-Match), then bumps it.
 	 */

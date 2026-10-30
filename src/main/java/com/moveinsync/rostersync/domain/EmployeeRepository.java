@@ -33,5 +33,11 @@ public interface EmployeeRepository {
 	 */
 	boolean updateTransportFields(TenantId tenantId, Employee employee, long expectedVersion);
 
+	/**
+	 * Marks the employee INACTIVE at the same HR version, only if the stored row is still
+	 * ACTIVE at that version. Returns false if it moved on.
+	 */
+	boolean markInactiveAtSameVersion(TenantId tenantId, Employee employee);
+
 	long countActive(TenantId tenantId);
 }

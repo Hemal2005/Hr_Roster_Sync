@@ -3,12 +3,15 @@ package com.moveinsync.rostersync.application;
 import com.moveinsync.rostersync.domain.AppliedEventLog;
 import com.moveinsync.rostersync.domain.ChangeEvent;
 import com.moveinsync.rostersync.domain.ChangeEventType;
+import com.moveinsync.rostersync.domain.DeactivateEmployee;
 import com.moveinsync.rostersync.domain.DomainException;
 import com.moveinsync.rostersync.domain.Employee;
 import com.moveinsync.rostersync.domain.EmployeeField;
+import com.moveinsync.rostersync.domain.EmployeeId;
 import com.moveinsync.rostersync.domain.EmployeeRepository;
 import com.moveinsync.rostersync.domain.EmployeeStatus;
 import com.moveinsync.rostersync.domain.ErrorCode;
+import com.moveinsync.rostersync.domain.EventHeader;
 import com.moveinsync.rostersync.domain.HrEvent;
 import com.moveinsync.rostersync.domain.Outbox;
 import com.moveinsync.rostersync.domain.PayloadHash;
@@ -20,6 +23,7 @@ import com.moveinsync.rostersync.domain.VersionPolicy;
 import com.moveinsync.rostersync.domain.validation.IncomingHrRecord;
 import com.moveinsync.rostersync.domain.validation.RecordValidator;
 import com.moveinsync.rostersync.domain.validation.ValidationError;
+import java.time.Instant;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
@@ -72,6 +76,43 @@ public class ApplyService {
 				log.info("hr event {} version={}", result.outcome(), record.version());
 			}
 			return result;
+		} finally {
+			MDC.remove("tenantId");
+			MDC.remove("employeeId");
+		}
+	}
+
+	/**
+	 * Deactivates an employee the nightly export no longer lists, but only if nothing
+	 * happened to them since the plan was made: still ACTIVE, still at
+	 * {@code expectedVersion}, and last changed no later than the export's {@code asOf}.
+	 * Returns false, changing nothing, otherwise.
+	 */
+	public boolean deactivateMissing(TenantId tenantId, EmployeeId employeeId, long expectedVersion, Instant asOf) {
+		MDC.put("tenantId", tenantId.value());
+		MDC.put("employeeId", employeeId.value());
+		try {
+			Boolean done = tx.execute(status -> {
+				Optional<Employee> stored = employees.findForUpdate(tenantId, employeeId);
+				if (stored.isEmpty()) {
+					return false;
+				}
+				Employee employee = stored.get();
+				if (employee.status() != EmployeeStatus.ACTIVE || employee.hrVersion() != expectedVersion
+						|| employee.lastHrEventAt().isAfter(asOf)) {
+					return false;
+				}
+				var header = new EventHeader(tenantId, ReconciliationSource.NAME, employeeId, expectedVersion, asOf);
+				Set<EmployeeField> changed = employee.deactivateAsMissingFromExport(
+						hasher.hash(new DeactivateEmployee(header, employee.hrFields())));
+				if (!employees.markInactiveAtSameVersion(tenantId, employee)) {
+					return false;
+				}
+				outbox.enqueue(ChangeEvent.of(employee, ChangeEventType.EMPLOYEE_DEACTIVATED, changed, asOf));
+				return true;
+			});
+			log.info("missing from export: {}", Boolean.TRUE.equals(done) ? "deactivated" : "skipped, changed since plan");
+			return Boolean.TRUE.equals(done);
 		} finally {
 			MDC.remove("tenantId");
 			MDC.remove("employeeId");

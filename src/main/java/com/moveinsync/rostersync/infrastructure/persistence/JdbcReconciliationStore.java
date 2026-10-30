@@ -7,7 +7,10 @@ import com.moveinsync.rostersync.application.reconciliation.RunStatus;
 import com.moveinsync.rostersync.domain.EmployeeStatus;
 import com.moveinsync.rostersync.domain.ErrorCode;
 import com.moveinsync.rostersync.domain.TenantId;
+import com.moveinsync.rostersync.domain.reconciliation.BrakeDecision;
 import com.moveinsync.rostersync.domain.reconciliation.ReconciliationAction;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import com.moveinsync.rostersync.domain.reconciliation.StoredEntry;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -102,6 +105,38 @@ class JdbcReconciliationStore implements ReconciliationStore {
 	}
 
 	@Override
+	public void recordBrake(UUID runId, BrakeDecision decision) {
+		boolean tripped = decision instanceof BrakeDecision.Trip;
+		String reason = decision instanceof BrakeDecision.Trip trip ? trip.reason().name() : null;
+		BigDecimal ratio = BigDecimal.valueOf(decision.missingRatio()).setScale(6, RoundingMode.HALF_UP);
+		jdbc.update("""
+				UPDATE reconciliation_run
+				SET missing_ratio = ?, brake_tripped = ?, brake_reason = ?,
+				    status = CASE WHEN ? THEN 'AWAITING_APPROVAL' ELSE status END
+				WHERE id = ? AND status = 'PLANNED'
+				""", ratio, tripped, reason, tripped, runId);
+	}
+
+	@Override
+	public boolean recordDecision(UUID runId, RunStatus to, String decidedBy) {
+		return jdbc.update("""
+				UPDATE reconciliation_run
+				SET status = ?, decided_by = ?, decided_at = now(),
+				    completed_at = CASE WHEN ? = 'REJECTED' THEN now() ELSE completed_at END
+				WHERE id = ? AND status = 'AWAITING_APPROVAL'
+				""", to.name(), decidedBy, to.name(), runId) == 1;
+	}
+
+	@Override
+	public void recordApplied(UUID runId, long applied, long skipped) {
+		jdbc.update("""
+				UPDATE reconciliation_run
+				SET applied = ?, skipped = ?, status = 'COMPLETED', completed_at = now()
+				WHERE id = ? AND status = 'APPLYING'
+				""", applied, skipped, runId);
+	}
+
+	@Override
 	public boolean transition(UUID runId, RunStatus from, RunStatus to) {
 		return jdbc.update("UPDATE reconciliation_run SET status = ? WHERE id = ? AND status = ?",
 				to.name(), runId, from.name()) == 1;
@@ -158,7 +193,7 @@ class JdbcReconciliationStore implements ReconciliationStore {
 				rs.getLong("conflicts"),
 				rs.getLong("active_before"),
 				rs.getBigDecimal("missing_ratio"),
-				(Long) rs.getObject("trailer_count", Long.class),
+				rs.getObject("trailer_count") == null ? null : rs.getLong("trailer_count"),
 				(Boolean) rs.getObject("trailer_ok", Boolean.class),
 				(Boolean) rs.getObject("brake_tripped", Boolean.class),
 				rs.getString("brake_reason"),

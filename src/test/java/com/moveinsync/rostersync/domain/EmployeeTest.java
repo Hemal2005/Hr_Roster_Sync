@@ -123,6 +123,19 @@ class EmployeeTest {
 	}
 
 	@Test
+	void missingFromExportDeactivatesAtTheSameVersion() {
+		Employee employee = Employee.createFrom(create(4, "BLR-01", "MORNING"), hash(4));
+
+		var changed = employee.deactivateAsMissingFromExport(hash(40));
+
+		assertThat(changed).containsExactly(EmployeeField.STATUS);
+		assertThat(employee.status()).isEqualTo(EmployeeStatus.INACTIVE);
+		assertThat(employee.hrVersion()).isEqualTo(4);
+		assertThat(employee.hrPayloadHash()).isEqualTo(hash(40));
+		assertThat(employee.deactivateAsMissingFromExport(hash(41))).isEmpty();
+	}
+
+	@Test
 	void restoreRebuildsEveryStoredValue() {
 		var transport = new TransportOwnedFields("Gate 2", null);
 		Employee employee = Employee.restore(TestEvents.TENANT, TestEvents.EMPLOYEE, TestEvents.fields("BLR-01", "DAY"),

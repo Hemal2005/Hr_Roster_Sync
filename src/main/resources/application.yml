@@ -30,6 +30,10 @@ spring:
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
 
 rostersync:
+  reconciliation:
+    # Share of active employees an export may miss before the run waits for an operator.
+    brake-threshold: 0.30
+    bucket-count: 64
   outbox:
     topic: rostersync.employee-changes
     batch-size: 100

@@ -2,6 +2,7 @@ package com.moveinsync.rostersync.application.reconciliation;
 
 import com.moveinsync.rostersync.domain.ErrorCode;
 import com.moveinsync.rostersync.domain.TenantId;
+import com.moveinsync.rostersync.domain.reconciliation.BrakeDecision;
 import com.moveinsync.rostersync.domain.reconciliation.PlanItem;
 import com.moveinsync.rostersync.domain.reconciliation.ReconciliationAction;
 import com.moveinsync.rostersync.domain.reconciliation.StoredEntry;
@@ -37,6 +38,15 @@ public interface ReconciliationStore {
 	void addErrors(UUID runId, List<RunError> errors);
 
 	void recordPlan(UUID runId, PlanSummary summary);
+
+	/** Stores the brake's verdict; a tripped run moves from PLANNED to AWAITING_APPROVAL. */
+	void recordBrake(UUID runId, BrakeDecision decision);
+
+	/** An operator's decision on a run awaiting approval; false if it was not awaiting. */
+	boolean recordDecision(UUID runId, RunStatus to, String decidedBy);
+
+	/** APPLYING to COMPLETED with the outcome counts. */
+	void recordApplied(UUID runId, long applied, long skipped);
 
 	/** Changes status only if it is still {@code from}; returns false otherwise. */
 	boolean transition(UUID runId, RunStatus from, RunStatus to);

@@ -110,6 +110,20 @@ class JdbcEmployeeRepository implements EmployeeRepository {
 	}
 
 	@Override
+	public boolean markInactiveAtSameVersion(TenantId tenantId, Employee employee) {
+		requireSameTenant(tenantId, employee);
+		int rows = jdbc.update("""
+				UPDATE employee
+				SET status = 'INACTIVE', hr_payload_hash = :hrPayloadHash, updated_at = now()
+				WHERE tenant_id = :tenantId AND employee_id = :employeeId
+				  AND hr_version = :hrVersion AND status = 'ACTIVE'
+				""", key(tenantId, employee.employeeId())
+				.addValue("hrPayloadHash", employee.hrPayloadHash().bytes())
+				.addValue("hrVersion", employee.hrVersion()));
+		return rows == 1;
+	}
+
+	@Override
 	@Transactional(readOnly = true)
 	public long countActive(TenantId tenantId) {
 		return jpa.countByTenantIdAndStatus(tenantId.value(), EmployeeStatus.ACTIVE.name());

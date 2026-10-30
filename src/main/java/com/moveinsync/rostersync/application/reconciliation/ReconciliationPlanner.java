@@ -1,5 +1,6 @@
 package com.moveinsync.rostersync.application.reconciliation;
 
+import com.moveinsync.rostersync.application.ReconciliationSource;
 import com.moveinsync.rostersync.application.reconciliation.ReconciliationStore.NewItem;
 import com.moveinsync.rostersync.application.reconciliation.ReconciliationStore.RunError;
 import com.moveinsync.rostersync.domain.EmployeeId;
@@ -59,7 +60,7 @@ import tools.jackson.databind.ObjectMapper;
 @Component
 public class ReconciliationPlanner {
 
-	public static final String SOURCE_SYSTEM = "nightly-export";
+	public static final String SOURCE_SYSTEM = ReconciliationSource.NAME;
 
 	private static final int BATCH = 1000;
 	private static final String VALID = "1";
