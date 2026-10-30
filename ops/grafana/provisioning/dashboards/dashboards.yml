@@ -1,0 +1,9 @@
+apiVersion: 1
+
+providers:
+  - name: hr-roster-sync
+    folder: HR Roster Sync
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

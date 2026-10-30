@@ -1,0 +1,103 @@
+# Unit tests for alerts.yml: scripts/check-alerts.sh runs them with promtool.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: first brake trip of a tenant pages, then resolves after 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'reconciliation_brake_tripped_total{tenant="acme",reason="FILE_TRUNCATED"}'
+        values: '_ _ _ 1x30'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ReconciliationBrakeTripped
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ReconciliationBrakeTripped
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              tenant: acme
+              reason: FILE_TRUNCATED
+            exp_annotations:
+              summary: "Nightly reconciliation for acme is waiting for an operator (FILE_TRUNCATED)"
+              action: "Nobody was deactivated. Check the run (GET /api/v1/reconciliations/{id}) and approve or reject it."
+      - eval_time: 25m
+        alertname: ReconciliationBrakeTripped
+        exp_alerts: []
+
+  - name: a later trip for the same tenant pages again
+    interval: 1m
+    input_series:
+      - series: 'reconciliation_brake_tripped_total{tenant="acme",reason="MISSING_RATIO_EXCEEDED"}'
+        values: '1x30 2x10'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ReconciliationBrakeTripped
+        exp_alerts: []
+      - eval_time: 33m
+        alertname: ReconciliationBrakeTripped
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              tenant: acme
+              reason: MISSING_RATIO_EXCEEDED
+            exp_annotations:
+              summary: "Nightly reconciliation for acme is waiting for an operator (MISSING_RATIO_EXCEEDED)"
+              action: "Nobody was deactivated. Check the run (GET /api/v1/reconciliations/{id}) and approve or reject it."
+
+  - name: outbox stuck for more than a minute pages
+    interval: 1m
+    input_series:
+      - series: 'outbox_oldest_age_seconds{application="hr-roster-sync"}'
+        values: '0 0 30 90 150 210 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OutboxNotDraining
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: OutboxNotDraining
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              application: hr-roster-sync
+            exp_annotations:
+              summary: "Oldest unsent change event is 3m 30s old"
+              action: "Check the broker and outbox.last_error_code; ingest keeps working meanwhile."
+      - eval_time: 6m
+        alertname: OutboxNotDraining
+        exp_alerts: []
+
+  - name: a third of records rejected for ten minutes opens a ticket
+    interval: 1m
+    input_series:
+      - series: 'hr_events_total{tenant="acme",outcome="APPLIED",code="NONE"}'
+        values: '0+60x40'
+      - series: 'hr_events_total{tenant="acme",outcome="REJECTED",code="INVALID_PHONE"}'
+        values: '0+30x40'
+      - series: 'hr_events_total{tenant="globex",outcome="APPLIED",code="NONE"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: HrRejectionSpike
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              tenant: acme
+            exp_annotations:
+              summary: "acme: 33.33% of HR records rejected"
+              action: "See hr_events_total by code; usually a changed field format or a missing office code at the client."
+
+  - name: one rejection in a quiet hour is not a spike
+    interval: 1m
+    input_series:
+      - series: 'hr_events_total{tenant="acme",outcome="APPLIED",code="NONE"}'
+        values: '0x40'
+      - series: 'hr_events_total{tenant="acme",outcome="REJECTED",code="INVALID_PHONE"}'
+        values: '0x20 1x20'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: HrRejectionSpike
+        exp_alerts: []

@@ -1,0 +1,57 @@
+groups:
+  - name: hr-roster-sync
+    rules:
+      # A run is waiting for an operator. The second half fires for a tenant's first trip,
+      # where the counter series is new and increase() has nothing to compare against.
+      - alert: ReconciliationBrakeTripped
+        expr: >
+          increase(reconciliation_brake_tripped_total[15m]) > 0
+          or (reconciliation_brake_tripped_total unless reconciliation_brake_tripped_total offset 15m)
+        labels:
+          severity: page
+        annotations:
+          summary: "Nightly reconciliation for {{ $labels.tenant }} is waiting for an operator ({{ $labels.reason }})"
+          action: "Nobody was deactivated. Check the run (GET /api/v1/reconciliations/{id}) and approve or reject it."
+
+      # The relay is not getting events to the broker: downstream (bookings) is falling behind.
+      - alert: OutboxNotDraining
+        expr: outbox_oldest_age_seconds > 60
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Oldest unsent change event is {{ $value | humanizeDuration }} old"
+          action: "Check the broker and outbox.last_error_code; ingest keeps working meanwhile."
+
+      # More than 20 % of a tenant's records rejected for 10 minutes, with real traffic.
+      - alert: HrRejectionSpike
+        expr: >
+          (
+            sum by (tenant) (rate(hr_events_total{outcome="REJECTED"}[10m]))
+            / sum by (tenant) (rate(hr_events_total[10m]))
+          ) > 0.2
+          and sum by (tenant) (rate(hr_events_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.tenant }}: {{ $value | humanizePercentage }} of HR records rejected"
+          action: "See hr_events_total by code; usually a changed field format or a missing office code at the client."
+
+      - alert: HrIngestLagHigh
+        expr: histogram_quantile(0.99, sum by (tenant, le) (rate(hr_ingest_lag_seconds_bucket[10m]))) > 300
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.tenant }}: p99 HR event lag is {{ $value | humanizeDuration }}"
+          action: "Changes reach us late; check the client's HR integration and our ingest latency."
+
+      - alert: RosterSyncDown
+        expr: up{job="hr-roster-sync"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Prometheus cannot scrape hr-roster-sync"
+          action: "Check the app's health endpoint and logs."
