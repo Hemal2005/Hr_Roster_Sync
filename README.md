@@ -159,7 +159,60 @@ Each rule from the case study: what it says, what goes wrong without it, how it 
   - [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java), including `lateCopyOfAnOldExitDoesNotCancelBookingsMadeAfterRehire`. That test fails if the check is removed.
   - [`BookingApiIT.anExitSentByHrCancelsTheBookingEndToEnd`](src/test/java/com/moveinsync/rostersync/api/booking/BookingApiIT.java).
 
-_Nightly reconciliation and the safety brake are described as they are built._
+### Nightly reconciliation
+
+- **The rule.** Every night HR sends the full list of employees. Compare it with what we hold and fix the differences: create the employees we do not have, update the ones that changed, deactivate the ones that are gone.
+- **Without care.** The simple version loads 200,000 file rows and 200,000 database rows into two maps. That needs hundreds of megabytes and grows with every client. Worse, it treats "not in the file" as "left the company", so a file that was cut short would deactivate everyone after the cut.
+- **The file.** A header names the client and the moment the export was taken, and a trailer states how many rows it holds:
+  ```
+  #HEADER,tenant=acme,as_of=2026-10-30T02:00:00Z
+  employee_id,version,first_name,last_name,email,phone,manager_id,office_code,shift_code,status
+  E000001,12,…,ACTIVE
+  #TRAILER,count=200000
+  ```
+  A file without the trailer, or with a wrong count, is treated as cut short.
+- **How: plan first, in two passes, then apply.** [`ReconciliationPlanner`](src/main/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlanner.java):
+  1. **Pass 1** streams the file one row at a time ([`ExportReader`](src/main/java/com/moveinsync/rostersync/application/reconciliation/ExportReader.java)). It validates each row with the same validators as the API, hashes its HR state, and appends a short line to one of 64 temporary bucket files. The bucket is `floorMod(murmur3(employee_id), 64)`, the same value stored in `employee.bucket`.
+  2. **Pass 2** takes one bucket at a time. It loads that bucket's file rows (about 3,000) and the matching database rows (`WHERE tenant_id = ? AND bucket = ?`, indexed), then compares them ([`ReconciliationDiffer`](src/main/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDiffer.java)):
+     | File row | Stored employee | Plan |
+     |---|---|---|
+     | valid, not stored | – | `CREATE` |
+     | newer version, different hash | any | `UPDATE` |
+     | same version, same hash | any | nothing |
+     | same version, different hash | any | conflict, reported, nothing changed |
+     | older version | any | nothing (the live feed is ahead) |
+     | missing | `ACTIVE`, last HR event at or before `as_of` | `DEACTIVATE` |
+     | invalid (bad phone, cut-off line…) | any | nothing; **the employee counts as present** |
+  3. The plan is stored in `reconciliation_item`, and bad lines in `reconciliation_error` by line number and code, never values. The temporary files are deleted.
+  4. If the safety brake (below) allows it, the plan is applied one employee at a time through the same [`ApplyService`](src/main/java/com/moveinsync/rostersync/application/ApplyService.java) as live events: same locking, same version rules, same outbox events.
+- **Why this way.**
+  - At most one bucket is in memory, so memory stays flat as files grow; the benchmark below runs on a 256 MB heap.
+  - Hashes make "has anything changed?" a comparison of 32 bytes instead of nine fields.
+  - **A missing employee is deactivated at the stored version, and only if nothing happened since the export.** The live feed keeps running while the file is processed or waits for approval. If the employee was changed after `as_of`, or their version moved since the plan was made, the deactivation is skipped. A stale file never undoes a newer live event.
+  - An invalid row never deactivates its employee. A broken line says nothing about whether the person left.
+- **Proof.**
+  - [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java) covers every row of the table.
+  - [`ReconciliationPlannerIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlannerIT.java): only changes are planned, bad lines are recorded by number and code, an invalid row never deactivates, and the working files are deleted.
+  - [`ReconciliationIT.approvalLaterStillRespectsLiveChangesMadeInBetween`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationIT.java).
+  - [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java): 200,000 employees, see [Performance and cost](#performance-and-cost).
+
+### The safety brake
+
+- **The rule.** If tonight's file would deactivate 30 % or more of a client's active employees, deactivate nobody, alert an operator, and wait for a human.
+- **Without it.** The case study's example: a file that stops at row 120,000 of 200,000 would mark 80,000 people as having left and cancel their cabs.
+- **How.** [`SafetyBrake`](src/main/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrake.java) looks at the finished plan, before anything is applied:
+  - `FILE_TRUNCATED`: the trailer is missing or its count is wrong. This trips even when nobody would be deactivated, because the file cannot be trusted.
+  - `MISSING_RATIO_EXCEEDED`: planned deactivations ÷ active employees ≥ `rostersync.reconciliation.brake-threshold` (default `0.30`), computed with `BigDecimal`.
+  - When it trips, the **whole** plan waits, creates and updates included: the run goes to `AWAITING_APPROVAL`. The counter `reconciliation.brake.tripped{tenant,reason}` goes up and a WARN line with the run id is logged.
+  - An operator reviews the counts with `GET /api/v1/reconciliations/{id}`, then calls `approve` (the plan is applied, still skipping anyone changed in the meantime) or `reject` (nothing is applied).
+  - Deciding twice, or deciding a run that is not waiting, is `409 RUN_NOT_AWAITING_APPROVAL`, so a double click cannot apply a plan twice.
+- **Why hold the whole plan?** A file cut short is suspect in every row, not only in the missing ones. Applying half a plan would also leave a state that matches neither the file nor yesterday.
+- **Proof.**
+  - [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java): thresholds, boundaries, zero active employees.
+  - [`ReconciliationIT.brakeStopsRun`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationIT.java) and `fileWithoutTrailerTripsEvenWhenNobodyIsMissing`.
+  - [`BrakeThresholdConfigIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/BrakeThresholdConfigIT.java): the threshold comes from configuration.
+  - [`ExampleUseCaseIT.truncatedFileAt120kDeactivatesNobody`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java): 200,000 employees and a file cut at row 120,000, mid-row. The run waits with `FILE_TRUNCATED` and 79,999 planned deactivations; the half row counts as present. Nobody is deactivated and no event is written, including after an operator rejects the run.
+  - [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java): approve, reject, deciding twice, roles.
 
 ## Design decisions
 
@@ -177,10 +230,10 @@ Every request carries a signed token (a JWT: a small JSON document signed with a
 
 | Role | Who | May call |
 |---|---|---|
-| `HR_INTEGRATION` | The client's HR system (a machine, not a person) | `POST /api/v1/hr/events:batch` |
+| `HR_INTEGRATION` | The client's HR system (a machine, not a person) | `POST /api/v1/hr/events:batch`, `POST /api/v1/reconciliations` (upload only) |
 | `ADMIN` | MoveInSync transport admin | `GET /api/v1/employees/{id}`, `PATCH /api/v1/employees/{id}/transport` |
 | `EMPLOYEE` | An employee | `GET /api/v1/employees/me` (own record only; the id is the token's subject) |
-| `OPERATOR` | Reviews nightly reconciliation runs | the reconciliation endpoints, when they exist |
+| `OPERATOR` | Reviews nightly reconciliation runs | `POST /api/v1/reconciliations`, `GET /api/v1/reconciliations/{id}` and `/errors`, `POST …/approve` and `…/reject` |
 
 - Everything not listed is **denied by default**: a new endpoint is closed until someone decides who may use it.
 - `HR_INTEGRATION` is an addition to the case study's three roles. The HR system is not a person, and giving it `ADMIN` would let it edit transport fields.
@@ -228,7 +281,24 @@ _Pending._
 
 ## Performance and cost
 
-_Pending._
+### Nightly reconciliation at 200,000 employees
+
+[`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java), run with `./mvnw verify -Pbenchmark`. The test JVM has a 256 MB heap (`-Xmx256m`); Postgres runs in Testcontainers on the same machine.
+
+| | |
+|---|---|
+| Stored employees | 200,000 |
+| Tonight's file | 201,000 employees with 1,000 changed, 1,000 missing (199,995 rows) |
+| Plan | 995 creates, 1,000 updates, 1,000 deactivations, 0 conflicts |
+| Planning (both passes, plan stored) | **3.0 s** |
+| Planning + applying 2,995 changes | **25.3 s** (budget: 60 s) |
+| Peak heap, Spring context included | **109 MB** of 256 MB |
+
+Machine: Apple M2, 8 cores, 8 GB RAM, macOS, JDK 21.0.13 (Temurin), Docker with 6 GB.
+
+- **Time.** Planning is O(n) in file rows plus stored rows: one streaming pass, then one indexed bucket query and an O(bucket) hash-map comparison per bucket. Applying is O(changes), one short transaction each. On a quiet night that is a few thousand changes, not 200,000.
+- **Space.** O(n / 64) in memory, for one bucket's file rows and stored rows, plus O(n) on disk for the temporary bucket files (about 16 MB for 200,000 rows). Doubling the client size doubles the disk use and the time, not the heap. Beyond a few million employees per client, `bucket-count` would be raised so that each bucket stays small.
+- **Where it stops scaling.** The apply step runs one employee per transaction (about 7 ms each here). A night that changes everyone, for example after a data migration at HR, would take around 25 minutes. That is acceptable for a nightly job and keeps each change safe against live events; batching would be the next step.
 
 ## Data model
 
@@ -288,6 +358,14 @@ erDiagram
 | `employee_event_log` | One row per applied HR change. The unique key `(tenant_id, source_system, employee_id, version)` means the database itself refuses to record the same change twice (idempotency). |
 
 Tables for change events, bookings and nightly reconciliation are added by later migrations, alongside the code that uses them.
+
+Nightly reconciliation ([`V4__reconciliation.sql`](src/main/resources/db/migration/V4__reconciliation.sql)):
+
+| Table | What it holds |
+|---|---|
+| `reconciliation_run` | One row per uploaded file: client, `as_of`, status (`RUNNING` → `PLANNED` → `APPLYING` → `COMPLETED`, or `AWAITING_APPROVAL` → `APPLYING` / `REJECTED`, or `FAILED`), the plan's counts, the trailer check, the brake's decision and reason, who decided and when, and how many changes were applied or skipped. |
+| `reconciliation_item` | The plan: one row per create, update or deactivation, with the version it was planned at. Creates and updates carry the HR fields to apply (JSONB) until the run is decided. |
+| `reconciliation_error` | One row per bad line: line number, employee id when readable, error code. Never the line's values. |
 
 ## API reference
 
@@ -369,6 +447,25 @@ Key: `tenant:employee`. Headers: `eventId`, `eventType`. Value:
 - `type` is one of `EMPLOYEE_CREATED`, `EMPLOYEE_UPDATED`, `EMPLOYEE_DEACTIVATED`, `EMPLOYEE_REACTIVATED` or `TRANSPORT_UPDATED`.
 - Delivery is at least once, so consumers must ignore an `eventId` they have already handled.
 
+### Nightly reconciliation
+
+`POST /api/v1/reconciliations` (`HR_INTEGRATION` or `OPERATOR`), multipart with the export as part `file`, up to 100 MB:
+```bash
+curl -s -X POST localhost:8080/api/v1/reconciliations -H "Authorization: Bearer $TOKEN" \
+  -F file=@data/generated/full-200k.csv
+# 202 {"runId":"9b2e…","status":"RUNNING"}, Location: /api/v1/reconciliations/9b2e…
+```
+- The header is checked straight away: `400 INVALID_EXPORT_HEADER` for a missing or malformed one, and `400 EXPORT_TENANT_MISMATCH` when it names another client. In both cases no run is created.
+- Everything else happens in the background, one run at a time.
+
+`GET /api/v1/reconciliations/{id}` (`OPERATOR`) returns the run: status, counts (`rowsRead`, `rowsInvalid`, `toCreate`, `toUpdate`, `toDeactivate`, `conflicts`, `activeBefore`, `missingRatio`), `trailerOk`, `brakeTripped`, `brakeReason`, `applied`, `skipped`, `decidedBy` and timestamps.
+
+`GET /api/v1/reconciliations/{id}/errors?page=0` (`OPERATOR`) lists 100 bad lines per page: `{"lineNo":13,"employeeId":"E11","code":"UNKNOWN_OFFICE"}`.
+
+`POST /api/v1/reconciliations/{id}/approve` → `202`, the plan is applied in the background. `POST …/reject` → `200`, nothing is applied. Both are `OPERATOR` only. A run that is not `AWAITING_APPROVAL` gives `409 RUN_NOT_AWAITING_APPROVAL`; another client's run gives `404`.
+
+A test export of any size: `scripts/generate-export.sh --rows 200000 [--truncate-at 120000] --out data/generated/x.csv`.
+
 ### `POST /dev/token` (only under the `dev` / `demo` profiles)
 
 ```bash
@@ -395,6 +492,8 @@ docker compose up -d postgres redpanda                 # Postgres 16 on :5432, K
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev  # the API on localhost:8080, with a local-only signing key
 ./mvnw test                                            # unit tests, no Docker needed
 ./mvnw verify                                          # unit + integration tests; each run starts its own Postgres
+./mvnw verify -Pbenchmark                              # only the 200,000-employee reconciliation benchmark, 256 MB heap
+scripts/generate-export.sh --rows 200000               # a synthetic nightly export in data/generated/
 docker compose down -v                                 # stop and delete the local database
 ```
 
