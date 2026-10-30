@@ -1,3 +1,13 @@
 spring:
   application:
     name: hr-roster-sync
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:rostersync}
+    username: ${DB_USER:rostersync}
+    password: ${DB_PASSWORD:rostersync}
+  jpa:
+    # Requests must not hold a database connection while rendering a response.
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; Hibernate only checks that its mapping matches.
+      ddl-auto: validate
