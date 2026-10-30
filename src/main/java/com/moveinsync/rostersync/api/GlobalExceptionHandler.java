@@ -30,6 +30,14 @@ public class GlobalExceptionHandler {
 		return respond(Problems.statusOf(e.code()), e.code());
 	}
 
+	@ExceptionHandler(FieldsRejectedException.class)
+	ResponseEntity<ProblemDetail> fieldsRejected(FieldsRejectedException e) {
+		HttpStatus status = Problems.statusOf(e.code());
+		ProblemDetail problem = Problems.of(status, e.code());
+		problem.setProperty("fields", e.fields().stream().sorted().toList());
+		return ResponseEntity.status(status).body(problem);
+	}
+
 	@ExceptionHandler(HttpMessageNotReadableException.class)
 	ResponseEntity<ProblemDetail> unreadable(HttpMessageNotReadableException e) {
 		return respond(HttpStatus.BAD_REQUEST, ErrorCode.MALFORMED_REQUEST);
