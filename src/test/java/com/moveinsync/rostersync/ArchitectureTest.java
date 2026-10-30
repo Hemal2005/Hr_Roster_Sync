@@ -26,6 +26,14 @@ class ArchitectureTest {
 	}
 
 	@Test
+	void applicationDependsOnPortsNotOnAdaptersOrTheWebLayer() {
+		noClasses().that().resideInAPackage("..application..")
+				.should().dependOnClassesThat().resideInAnyPackage("..infrastructure..", "..api..")
+				.because("use cases talk to the outside through ports the infrastructure implements")
+				.check(PRODUCTION_CLASSES);
+	}
+
+	@Test
 	void domainNeverReachesIntoInfrastructure() {
 		noClasses().that().resideInAPackage("..domain..")
 				.should().dependOnClassesThat().resideInAPackage("..infrastructure..")

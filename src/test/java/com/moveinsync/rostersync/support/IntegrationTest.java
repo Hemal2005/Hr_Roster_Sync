@@ -22,7 +22,8 @@ public abstract class IntegrationTest {
 
 	@BeforeEach
 	void emptyTables() {
-		jdbc.execute("TRUNCATE processed_message, booking, trip, outbox, employee_event_log, employee, office, tenant");
+		jdbc.execute("TRUNCATE reconciliation_error, reconciliation_item, reconciliation_run, processed_message, booking, "
+				+ "trip, outbox, employee_event_log, employee, office, tenant");
 	}
 
 	protected void givenTenant(String tenantId, String... officeCodes) {
