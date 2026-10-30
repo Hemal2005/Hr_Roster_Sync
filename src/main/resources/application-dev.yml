@@ -1,0 +1,4 @@
+# Local development only. Never deploy with this profile or this key.
+rostersync:
+  security:
+    jwt-secret: dev-only-signing-key-change-me-0123456789abcdef

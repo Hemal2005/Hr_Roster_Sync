@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.ActiveProfiles;
 
 /**
  * Base for tests that need the full application against a real Postgres. Spring caches
@@ -12,6 +13,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
  * starts once per run; tables are emptied before every test instead.
  */
 @SpringBootTest
+@ActiveProfiles("test")
 @Import(PostgresContainerConfig.class)
 public abstract class IntegrationTest {
 

@@ -4,6 +4,8 @@ package com.moveinsync.rostersync.domain;
  * Stable codes returned to clients and written to logs. Codes never carry field values.
  */
 public enum ErrorCode {
+	MALFORMED_RECORD,
+	INVALID_EVENT_TYPE,
 	MISSING_REQUIRED_FIELD,
 	INVALID_VERSION,
 	INVALID_EMAIL,
