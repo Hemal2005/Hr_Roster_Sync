@@ -43,7 +43,85 @@ _Pending._
 
 ## The rules, explained
 
-_Pending._
+Each rule from the case study: what it says, what goes wrong without it, how it is solved, why this way, and the test that proves it.
+
+### Validate at the boundary; one bad record never fails a batch
+
+- **The rule.** Reject invalid records (malformed phone, unknown office code, missing fields) with a per-record error report. One bad record must never fail a whole batch.
+- **Without it.** A typo in one of 100 joiners blocks the other 99 from getting a cab until someone fixes the file, or a malformed phone number is stored and the driver cannot call.
+- **How.**
+  - The batch endpoint keeps each event as raw JSON until it is that record's turn, so even a wrongly typed field rejects only its own record.
+  - Each record is validated by a chain of validators ([`CompositeValidator`](src/main/java/com/moveinsync/rostersync/domain/validation/CompositeValidator.java)):
+    - required fields;
+    - email shape;
+    - phone in canonical E.164, checked with Google's libphonenumber;
+    - office code known for this client.
+  - Each valid record is applied in **its own database transaction** ([`ApplyService`](src/main/java/com/moveinsync/rostersync/application/ApplyService.java)).
+  - The response is `200` with one result per record: index, employee id, outcome, and an error code for rejections.
+- **Why this way.** Wrapping the whole batch in one transaction would let a single database error roll back 99 good records. Per-record transactions cost more round trips but make every record independent.
+- **Proof.**
+  - [`IngestControllerIT.oneBadRecordDoesNotFailBatch`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java): 1 bad phone in 100 → 99 applied, 1 rejected with `INVALID_PHONE`.
+  - `wronglyTypedFieldRejectsOnlyItsRecord`.
+  - [`CompositeValidatorTest`](src/test/java/com/moveinsync/rostersync/domain/validation/CompositeValidatorTest.java).
+
+### Per-employee order, idempotency key and version comparison
+
+- **The rule.** Apply changes per employee in version order; a stale update is ignored and a duplicate is a no-op. Define the idempotency key and the version comparison.
+- **Without it.** A retry is applied twice, or an older shift change that arrives late overwrites a newer transfer, and the employee is sent to the wrong office.
+- **How.** Every event carries the source system's per-employee `version` and the employee's **full** HR-owned state, not just the changed field. Inside a transaction that locks the employee's row (`SELECT … FOR UPDATE`), [`VersionPolicy`](src/main/java/com/moveinsync/rostersync/domain/VersionPolicy.java) decides:
+
+  | Stored | Incoming | Decision | Effect |
+  |---|---|---|---|
+  | nothing | any | APPLY | create the employee |
+  | v | > v | APPLY | write HR fields, record the change |
+  | v | = v, same content hash | DUPLICATE | nothing written |
+  | v | = v, different content hash | REJECTED `VERSION_CONFLICT` | nothing written |
+  | v | < v | STALE | nothing written |
+
+  - **Idempotency key:** `(tenant_id, source_system, employee_id, version)`. The database enforces it with a unique key on the applied-event log.
+  - **Content hash:** SHA-256 of the employee's HR state, in a fixed encoding.
+  - **Defence in depth:** the write itself is conditional: `UPDATE … WHERE hr_version < :incoming`.
+- **Why this way.**
+  - Because events carry full state, "accept only newer versions" gives the same end result as applying every event in order, without queues or reordering buffers.
+  - The lock serialises events for one employee only; different employees proceed in parallel.
+  - The case study's example: a transfer (v7) arrives before a shift change (v6). v6 is stale, and the employee ends up in the new office with the v7 shift, which already contains the v6 change.
+- **Proof.**
+  - [`ExampleUseCaseIT.transferV7BeforeShiftV6`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java).
+  - [`ApplyServiceIT`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java): `staleIgnored`, `duplicateIsNoOp`, `sameVersionWithDifferentContentIsRejectedAsConflict`.
+  - [`ReplayFeedTwiceIT`](src/test/java/com/moveinsync/rostersync/ReplayFeedTwiceIT.java): a shuffled 1,000-event feed sent twice; after the second run every row, column by column including timestamps, and the change log are identical.
+  - [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java): 32 threads, versions 1–200 shuffled → final version 200, no version applied twice, no lost update. Without the lock and the conditional update this test fails.
+
+### Field ownership and the conflict rule
+
+- **The rule.** HR owns name, email, manager and office; the transport admin owns pickup point and special-assistance needs. An HR update never overwrites a transport-owned field, and the conflict rule is written down.
+- **Without it.** A routine HR update wipes the pickup point the transport admin set, and the cab goes to the wrong address.
+- **The conflict rule.**
+  1. Every field has exactly one owner ([`EmployeeField`](src/main/java/com/moveinsync/rostersync/domain/EmployeeField.java)). Phone, shift and status come from the HR system and are HR-owned (an assumption: the case study lists only name, email, manager and office).
+  2. Only the owner's write path changes a field, and each owner has its own version (`hr_version`, `transport_version`), so neither can make the other's updates look stale.
+  3. A value for a field the writer does not own is ignored and counted (`hr_owned_field_violation_total`); the rest of the record is still applied.
+  4. There is no "last write wins" across owners.
+- **How.** The HR update statement names only HR columns and the transport update only transport columns. Writes never go through the ORM, whose change tracking would write every column.
+- **Proof.**
+  - [`ApplyServiceIT.hrCannotOverwriteTransportFields`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java).
+  - [`IngestControllerIT.transportFieldsInAnHrPayloadAreIgnoredAndCounted`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java).
+  - [`EmployeeRepositoryIT.hrWritesNeverTouchTransportColumns`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/EmployeeRepositoryIT.java).
+  - [`FieldOwnershipPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/FieldOwnershipPolicyTest.java).
+
+### No personal data in logs or error reports
+
+- **The rule.** Never write personal data into logs or error reports; use employee ids.
+- **How.**
+  - Logs are JSON lines carrying `traceId`, `tenantId` and `employeeId` as fields.
+  - Error responses carry a stable `code` and the `traceId`, plus field *names* for validation errors.
+  - Exception messages are never copied into a response or a log line, because a database message can contain the very value it rejected.
+  - `toString()` of every domain object that holds personal data lists field names only.
+- **Proof.**
+  - [`IngestControllerIT.errorReportContainsNoPersonalData`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java).
+  - [`GlobalExceptionHandlerTest`](src/test/java/com/moveinsync/rostersync/api/GlobalExceptionHandlerTest.java).
+  - The domain `toString` tests.
+  - A test that captures every log line of the whole suite comes with the monitoring work.
+
+_Nightly reconciliation, the safety brake, the outbox and deactivation side effects are described as they are built._
 
 ## Design decisions
 
@@ -134,18 +212,68 @@ Tables for change events, bookings and nightly reconciliation are added by later
 
 ## API reference
 
-_Pending._
+All endpoints are under `/api/v1`, take and return JSON, and need a bearer token. The client (tenant) is taken from the token's `tenant_id` claim, never from the URL or body.
+
+### `POST /api/v1/hr/events:batch`
+
+Up to 1,000 HR events; each is handled on its own.
+
+```json
+{
+  "sourceSystem": "workday",
+  "events": [
+    { "type": "UPDATE", "employeeId": "E000042", "version": 7, "occurredAt": "2026-10-30T08:00:07Z",
+      "firstName": "…", "lastName": "…", "email": "…", "phone": "+919876543210",
+      "managerId": "E000001", "officeCode": "HYD-02", "shiftCode": "NIGHT" },
+    { "type": "DEACTIVATE", "employeeId": "E000043", "version": 12, "occurredAt": "2026-10-30T09:00:00Z" }
+  ]
+}
+```
+
+- `type` is `CREATE`, `UPDATE` or `DEACTIVATE`.
+- A `DEACTIVATE` may send only the header, as above, or the full record (recommended): with the full record, an exit that arrives before any other event for that employee is still recorded.
+
+Response `200`:
+```json
+{ "results": [
+  { "index": 0, "employeeId": "E000042", "outcome": "APPLIED" },
+  { "index": 1, "employeeId": "E000043", "outcome": "REJECTED", "errorCode": "UNKNOWN_EMPLOYEE" }
+] }
+```
+
+`outcome` is `APPLIED`, `DUPLICATE`, `STALE` or `REJECTED`. Rejection codes:
+- `MALFORMED_RECORD`
+- `INVALID_EVENT_TYPE`
+- `MISSING_REQUIRED_FIELD`
+- `INVALID_VERSION`
+- `INVALID_EMAIL`
+- `INVALID_PHONE`
+- `UNKNOWN_OFFICE`
+- `UNKNOWN_EMPLOYEE`
+- `VERSION_CONFLICT`
+
+### Errors
+
+Every error is an [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) problem document with a stable `code` and the request's `traceId`. The same id is returned in the `X-Trace-Id` header and appears on every log line of that request.
+
+```json
+{ "type": "urn:rostersync:error:invalid-request", "title": "Bad Request", "status": 400,
+  "code": "INVALID_REQUEST", "fields": ["events"], "traceId": "6f1c…" }
+```
 
 ## Run it
 
 Prerequisites: JDK 21 and Docker. Maven is not required; the project ships with the Maven wrapper.
 
 ```bash
-docker compose up -d postgres   # Postgres 16 on localhost:5432 (local-only credentials: rostersync / rostersync)
-./mvnw test                     # unit tests, no Docker needed
-./mvnw verify                   # unit + integration tests; each run starts its own throwaway Postgres
-docker compose down -v          # stop and delete the local database
+docker compose up -d postgres                          # Postgres 16 on localhost:5432 (local-only credentials)
+./mvnw spring-boot:run -Dspring-boot.run.profiles=dev  # the API on localhost:8080, with a local-only signing key
+./mvnw test                                            # unit tests, no Docker needed
+./mvnw verify                                          # unit + integration tests; each run starts its own Postgres
+docker compose down -v                                 # stop and delete the local database
 ```
+
+The application refuses to start without a token signing key (`rostersync.security.jwt-secret`, at least 32 bytes). The `dev` profile supplies a local-only one; any real deployment must provide its own.
 
 Integration tests never use the `docker compose` database: they start a separate Postgres through Testcontainers, so Docker must be running for `./mvnw verify`.
 
