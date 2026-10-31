@@ -8,7 +8,7 @@ Companies keep their employee list in an HR system and send changes to MoveInSyn
 2. [At a glance](#at-a-glance)
 3. [The problem in plain words](#the-problem-in-plain-words)
 4. [The problems we solved](#the-problems-we-solved), each with how, the decisions, and how to test it
-5. [How it works — the big picture](#how-it-works--the-big-picture)
+5. [How it works — the big picture](#how-it-works--the-big-picture), and [where the core logic lives](#where-the-core-logic-lives)
 6. [The workflows, step by step](#the-workflows-step-by-step)
 7. [API reference: every route](#api-reference-every-route)
 8. [Testing: how to run every test](#testing-how-to-run-every-test)
@@ -525,6 +525,22 @@ flowchart LR
 14. The transport admin edits pickup points and special-assistance notes. Those fields belong to transport, and HR can never overwrite them.
 
 Code layers (enforced by [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java)): `api` (HTTP) → `application` (use cases, transactions) → `domain` (the rules, plain Java) ← `infrastructure` (database, Kafka, caches). The rules can be tested without a server or database.
+
+### Where the core logic lives
+
+The whole service is about 4,200 lines of Java in 115 small classes, with about 5,000 lines of tests. These files hold the logic that matters; reading them in this order follows a change from arrival to its effects.
+
+| File | What it decides | Proved by |
+|---|---|---|
+| [`IngestController`](src/main/java/com/moveinsync/rostersync/api/ingest/IngestController.java) | Reads each record of a batch on its own, so one broken record can't fail the rest | [`IngestControllerIT`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java) |
+| [`CompositeValidator`](src/main/java/com/moveinsync/rostersync/domain/validation/CompositeValidator.java) | Is this record valid (required fields, email, phone, office)? | [`CompositeValidatorTest`](src/test/java/com/moveinsync/rostersync/domain/validation/CompositeValidatorTest.java) |
+| [`ApplyService`](src/main/java/com/moveinsync/rostersync/application/ApplyService.java) | The heart of ingest: lock the employee, apply the version rule, write, record the change and its event, all in one transaction | [`ApplyServiceIT`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java), [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java) |
+| [`VersionPolicy`](src/main/java/com/moveinsync/rostersync/domain/VersionPolicy.java) | Apply, duplicate, conflict or stale? | [`VersionPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/VersionPolicyTest.java) |
+| [`FieldOwnershipPolicy`](src/main/java/com/moveinsync/rostersync/domain/FieldOwnershipPolicy.java) + [`JdbcEmployeeRepository`](src/main/java/com/moveinsync/rostersync/infrastructure/persistence/JdbcEmployeeRepository.java) | Who owns each field, and the separate HR and transport writes that enforce it | [`FieldOwnershipPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/FieldOwnershipPolicyTest.java), [`EmployeeRepositoryIT`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/EmployeeRepositoryIT.java) |
+| [`ReconciliationPlanner`](src/main/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlanner.java) + [`ReconciliationDiffer`](src/main/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDiffer.java) | The nightly comparison: two passes over 64 buckets, and what to create, update or deactivate | [`ReconciliationPlannerIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlannerIT.java), [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java) |
+| [`SafetyBrake`](src/main/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrake.java) | Is this nightly plan safe to apply, or must a person decide? | [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java), [`ExampleUseCaseIT`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java) |
+| [`OutboxRelay`](src/main/java/com/moveinsync/rostersync/application/OutboxRelay.java) | Publishes change events in order, never losing one across a crash | [`OutboxRelayIT`](src/test/java/com/moveinsync/rostersync/application/OutboxRelayIT.java), [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java) |
+| [`DeactivationHandler`](src/main/java/com/moveinsync/rostersync/application/DeactivationHandler.java) | An exit cancels future bookings and frees seats, exactly once | [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java) |
 
 ## The workflows, step by step
 
