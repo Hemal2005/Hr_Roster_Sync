@@ -56,7 +56,7 @@ Layers (enforced by [`ArchitectureTest`](../src/test/java/com/moveinsync/rosters
 | 6 | **Nightly diff in 64 hash buckets, plan first, then a safety brake** | Bounded memory; nothing is applied until the whole file is known to be complete and plausible | Temp disk; two passes over the file |
 | 7 | **CP for the employee store, eventual consistency downstream** | A wrong roster is worse than a short refusal; bookings can lag a second | Ingest is unavailable while the database is |
 
-The full list (D1–D20) is in the [README](../README.md#design-decisions).
+Each decision, with the problem it solves and the test that proves it, is in the [README](../README.md#the-problems-we-solved).
 
 ### The conflict rule (written down)
 - **HR owns:** first and last name, email, phone, manager, office, shift and employment status.

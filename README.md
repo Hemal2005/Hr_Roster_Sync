@@ -4,26 +4,132 @@ Companies keep their employee list in an HR system and send changes to MoveInSyn
 
 ## Contents
 
-1. [At a glance](#at-a-glance)
-2. [The problem in plain words](#the-problem-in-plain-words)
-3. [How it works — the big picture](#how-it-works--the-big-picture)
-4. [The workflows, step by step](#the-workflows-step-by-step)
-5. [The rules, explained](#the-rules-explained)
-6. [Design decisions](#design-decisions)
-7. [Trade-offs: consistency vs availability vs latency](#trade-offs-consistency-vs-availability-vs-latency)
-8. [Security and tenant isolation](#security-and-tenant-isolation)
-9. [Failure handling](#failure-handling)
-10. [Monitoring — what on-call sees at 3 AM](#monitoring--what-on-call-sees-at-3-am)
-11. [Caching](#caching)
-12. [Performance and cost](#performance-and-cost)
-13. [Data model](#data-model)
-14. [API reference](#api-reference)
-15. [Run it](#run-it)
-16. [Project structure](#project-structure)
-17. [Testing strategy](#testing-strategy)
-18. [Assumptions](#assumptions)
-19. [Deliberately left out](#deliberately-left-out)
-20. [Glossary](#glossary)
+1. [Run it in 5 minutes](#run-it-in-5-minutes)
+2. [At a glance](#at-a-glance)
+3. [The problem in plain words](#the-problem-in-plain-words)
+4. [The problems we solved](#the-problems-we-solved), each with how, the decisions, and how to test it
+5. [How it works — the big picture](#how-it-works--the-big-picture)
+6. [The workflows, step by step](#the-workflows-step-by-step)
+7. [API reference: every route](#api-reference-every-route)
+8. [Testing: how to run every test](#testing-how-to-run-every-test)
+9. [Trade-offs: consistency vs availability vs latency](#trade-offs-consistency-vs-availability-vs-latency)
+10. [Security and tenant isolation](#security-and-tenant-isolation)
+11. [Failure handling](#failure-handling)
+12. [Monitoring — what on-call sees at 3 AM](#monitoring--what-on-call-sees-at-3-am)
+13. [Caching](#caching)
+14. [Performance and cost](#performance-and-cost)
+15. [Data model](#data-model)
+16. [Technology choices](#technology-choices)
+17. [Assumptions](#assumptions)
+18. [Deliberately left out](#deliberately-left-out)
+19. [Project structure](#project-structure)
+20. [For developers](#for-developers)
+21. [Glossary](#glossary)
+
+More: [design note](docs/design-note.md) (architecture, sequences, failure modes) · [traceability matrix](docs/traceability.md) · [curl examples](docs/curl-examples.md) · [Postman collection](docs/postman_collection.json)
+
+## Run it in 5 minutes
+
+This is everything a reviewer needs. There's nothing to install except Docker.
+
+### What you need
+
+| | |
+|---|---|
+| **Docker** | [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS or Windows, or Docker Engine with Compose v2 on Linux. Give it **at least 4 GB of memory** (Settings → Resources) |
+| **Free ports** | 8080 (API), 3000 (Grafana), 9090 (Prometheus), 5432 (PostgreSQL), 19092 (Kafka) |
+| **For the guided tour** (optional) | `bash`, `curl` and `python3`. macOS and Linux have them; on Windows use Git Bash or WSL, or use Postman instead |
+
+No Java, Maven, database or Kafka installation is needed: everything runs in containers.
+
+### 1. Start everything with one command
+
+```bash
+git clone https://github.com/Hemal2005/Hr_Roster_Sync.git
+cd Hr_Roster_Sync
+docker compose up -d --build --wait
+```
+
+- The first run builds the application image and downloads the others: about 3–5 minutes. Later starts take seconds.
+- `--wait` returns once all five services report healthy. Plain `docker compose up` works too: it keeps the logs in that terminal, so use a second terminal for the steps below.
+- Check it's ready:
+  ```bash
+  curl -s localhost:8080/actuator/health
+  # {"groups":["liveness","readiness"],"status":"UP"}
+  ```
+
+### 2. Try it (pick one)
+
+**A. The guided tour (recommended, about 30 seconds).** It walks through every rule against the running service and prints what happens:
+```bash
+scripts/demo-tour.sh
+```
+It covers a new joiner, a duplicate, changes out of order, a batch with bad records, HR vs transport fields, another client being refused, a booking cancelled by an exit, a normal night, a cut-off night held by the safety brake, and an operator approving a held night. Each step, with its expected output, is in [docs/curl-examples.md](docs/curl-examples.md).
+
+**B. Postman.** Import [docs/postman_collection.json](docs/postman_collection.json). Run the requests in folder **"0. Tokens"** first, which saves the tokens, then any request in folders 1–5.
+
+**C. Three requests by hand:**
+```bash
+# 1. a token for the demo HR system of client "acme"
+TOKEN=$(curl -s -X POST localhost:8080/dev/token -H 'Content-Type: application/json' \
+  -d '{"tenantId":"acme","subject":"workday","roles":["HR_INTEGRATION"]}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 2. a new joiner
+curl -s -X POST localhost:8080/api/v1/hr/events:batch -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"sourceSystem":"workday","events":[{"type":"CREATE","employeeId":"E000042","version":1,"occurredAt":"2026-10-30T08:00:00Z",
+       "firstName":"Asha","email":"asha@acme.example","phone":"+919876543210","officeCode":"BLR-01","shiftCode":"DAY"}]}'
+# {"results":[{"index":0,"employeeId":"E000042","outcome":"APPLIED"}]}
+
+# 3. the same request again: nothing changes
+# {"results":[{"index":0,"employeeId":"E000042","outcome":"DUPLICATE"}]}
+```
+
+### 3. Look inside
+
+| Open | What you see |
+|---|---|
+| http://localhost:3000 | Grafana dashboard **HR Roster Sync**: records by outcome, rejections by code, ingest lag, outbox, brake trips, caches (no login needed to view) |
+| http://localhost:9090/alerts | Prometheus alert rules; after the tour, **ReconciliationBrakeTripped** is firing |
+| http://localhost:8080/actuator/prometheus | The raw metrics |
+
+### 4. Stop or reset
+
+```bash
+docker compose down        # stop; the data is kept
+docker compose down -v     # stop and delete all data (a clean start next time)
+```
+Run `docker compose down -v` before running the tour a second time if you want exactly the outputs in [docs/curl-examples.md](docs/curl-examples.md).
+
+### If something goes wrong
+
+| Symptom | Fix |
+|---|---|
+| `Cannot connect to the Docker daemon` | Start Docker Desktop and wait until it says it's running |
+| `port is already allocated` / `address already in use` | Another program uses that port (often a local PostgreSQL on 5432). Stop it, or change the left-hand port in `docker-compose.yml` (for example `"5433:5432"`) |
+| A container shows `unhealthy` or exits with code 137 | Docker is out of memory: give it at least 4 GB, then `docker compose up -d --wait` again |
+| `--wait` isn't recognised | An older Compose: run `docker compose up -d --build`, wait a minute, then check health with the `curl` above |
+| `scripts/demo-tour.sh: Permission denied` | `bash scripts/demo-tour.sh` |
+| Tour outputs differ from the docs | The data from an earlier run is still there: `docker compose down -v`, then start again |
+| Anything else | `docker compose logs app` shows the application's log |
+
+### Demo data and identities
+
+> **The `demo` profile is for local evaluation only, and it is off unless you ask for it.** It turns on `POST /dev/token`, which hands out a token for any tenant and role, and it loads demo data. Its signing key comes from `ROSTERSYNC_SECURITY_JWT_SECRET`, which defaults to a demo key in `docker-compose.yml`. A real deployment runs without `demo` or `dev`, provides its own key, and gets tokens from its identity provider.
+
+**Demo data** ([`R__demo_seed.sql`](src/main/resources/db/demo/R__demo_seed.sql)):
+- tenants `acme` (offices `BLR-01`, `HYD-02`, and `PUN-03`, which is inactive) and `globex` (`BLR-01`, `CHN-01`);
+- trips `T-ACME-1`, `T-ACME-2` and `T-GLOBEX-1` tomorrow, plus `T-ACME-OLD`, which already ran.
+Employees come in through the API, as in real life.
+
+**Demo users** are token identities; ask `/dev/token` for any of them:
+
+| Tenant | Subject | Role | Use |
+|---|---|---|---|
+| `acme` | `workday` | `HR_INTEGRATION` | send HR events, upload a nightly file |
+| `acme` | `admin-1` | `ADMIN` | read employees, edit transport fields, book trips |
+| `acme` | `ops-1` | `OPERATOR` | review, approve or reject nightly runs |
+| `acme` | `E000042` | `EMPLOYEE` | `GET /api/v1/employees/me` once E000042 exists |
+| `globex` | `workday` | `HR_INTEGRATION` | the second tenant, to see isolation |
 
 ## At a glance
 
@@ -67,6 +173,321 @@ In the real world those messages misbehave:
 | The service crashes right after saving a change | The booking system never hears about an exit, and a cab still waits for someone who has left |
 
 This service keeps the employee records correct through all of that. Where something is too risky to decide alone, as with the cut-off file, it stops and asks a person.
+
+## The problems we solved
+
+Each problem from the case study, in the same shape:
+- **what goes wrong** in real life;
+- **how we solved it**;
+- **the decisions we made**, and what we chose not to do;
+- **how to see it yourself**;
+- **how it's tested**, with the command to run that test.
+
+All test commands need JDK 21 (and Docker for integration tests); see [Testing: how to run every test](#testing-how-to-run-every-test).
+
+### 1. A bad record must not block the good ones
+
+- **What goes wrong.** A batch of 100 joiners contains one typo. If the whole batch is rejected, 99 people have no cab until someone fixes the file. If the typo is stored, the driver can't call a broken phone number.
+- **How we solved it.**
+  - Each record in a batch is read, validated and saved **on its own**.
+  - Validation checks required fields, the email's shape, the phone number (international E.164 format, checked with Google's libphonenumber), and that the office code exists and is active for that client.
+  - The answer lists every record: its position, employee id, outcome and, for a rejection, a stable error code. It never echoes the rejected values.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | One database transaction per record | A database error on record 37 undoes only record 37 | One transaction per batch: one failure would undo 99 good records |
+  | Keep each record as raw JSON until its turn | A record with a wrongly typed field (`"version": "abc"`) is rejected alone, instead of the whole request failing to parse | Parsing the whole body into typed objects up front |
+  | Phone numbers must already be in E.164 (`+919876543210`) | Guessing the country of a local number could turn a valid number into someone else's | Normalising local formats |
+  | Validators as small separate classes | Each rule is tested alone; a new rule is a new class | One large validation method |
+- **See it yourself.** [Guided tour step 4](docs/curl-examples.md#4-one-batch-several-bad-records): one batch, five records, four different rejection codes, and the good record applied.
+- **How it's tested.**
+  - [`IngestControllerIT.oneBadRecordDoesNotFailBatch`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java): 1 bad phone in 100 → 99 applied, 1 `INVALID_PHONE`
+  - [`IngestControllerIT.wronglyTypedFieldRejectsOnlyItsRecord`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java)
+  - [`CompositeValidatorTest`](src/test/java/com/moveinsync/rostersync/domain/validation/CompositeValidatorTest.java): every validation rule, 19 cases
+  - Run: `./mvnw test -Dtest=CompositeValidatorTest` · `./mvnw verify -Dit.test=IngestControllerIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 2. The same change arrives twice
+
+- **What goes wrong.** HR's system retries after a timeout, so the same change arrives again. Applied twice, it could create two bookings, send two notifications, or undo a newer change.
+- **How we solved it.**
+  - Every change carries a **version** number per employee from HR.
+  - If the stored version equals the incoming one **and** the content is the same (compared by a fingerprint, a SHA-256 hash of the HR fields), it's a duplicate: nothing is written and no event is sent.
+  - The **idempotency key** is `(client, source system, employee id, version)`, and a unique key in the database refuses to record the same change twice.
+  - Same version with **different** content is a contradiction, so it's rejected as `VERSION_CONFLICT` and counted, never guessed.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Use HR's own per-employee version | HR already sends it; it identifies the *change*, not the request | An `Idempotency-Key` header: a re-sent batch with a new key would slip through |
+  | Detect duplicates with the version rule, not a lookup table | One comparison inside the row lock handles duplicates and ordering together | A dedupe table read and written on every event |
+  | Reject same-version-different-content | A version should identify one state; guessing could overwrite correct data | Last write wins |
+- **See it yourself.** [Tour step 2](docs/curl-examples.md#2-the-same-event-again-nothing-changes-idempotency).
+- **How it's tested.**
+  - [`ReplayFeedTwiceIT`](src/test/java/com/moveinsync/rostersync/ReplayFeedTwiceIT.java): a shuffled 1,000-event feed sent twice; every row, column by column, and the change log are identical afterwards
+  - [`ApplyServiceIT`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java): `duplicateIsNoOp`, `sameVersionWithDifferentContentIsRejectedAsConflict`
+  - [`VersionPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/VersionPolicyTest.java): the whole decision table
+  - [`SchemaIT.theSameAppliedChangeCannotBeLoggedTwice`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/SchemaIT.java): the database refuses it too
+  - Run: `./mvnw verify -Dit.test=ReplayFeedTwiceIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 3. Changes arrive out of order, or at the same moment
+
+- **What goes wrong.** The case study's example: an office transfer (version 7) arrives before a shift change (version 6). Applied in arrival order, the old shift change overwrites the transfer, and the cab goes to the wrong office. Two servers applying changes to the same employee at the same moment can also lose one of them.
+- **How we solved it.**
+  - The rule:
+
+    | Stored | Incoming | Decision |
+    |---|---|---|
+    | nothing | any | APPLY (create) |
+    | v | newer than v | APPLY |
+    | v | v, same content | DUPLICATE (nothing written) |
+    | v | v, different content | REJECTED `VERSION_CONFLICT` |
+    | v | older than v | STALE (ignored) |
+  - Every event carries the employee's **full** HR state, so ignoring an older event loses nothing: the newer one already contains it.
+  - The decision runs inside a lock on that employee's row (`SELECT … FOR UPDATE`), so changes to one employee are applied one at a time. Different employees never wait for each other.
+  - The write itself is conditional (`… WHERE hr_version < new version`) as a second guard.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Full-state events | Ignoring a stale event is always safe | Deltas, which need a version per field and merge rules |
+  | Versions, not timestamps | Clocks drift; two changes can share a millisecond | Timestamps; arrival order |
+  | Lock the row (pessimistic) for HR changes | Machine feeds often hit the same employee; a lock queues them, with no retry storms | Optimistic retries |
+  | An update for an unknown employee creates them | v2 can arrive before v1, and it carries the full state | Rejecting it and losing the change |
+- **See it yourself.** [Tour step 3](docs/curl-examples.md#3-out-of-order-v3-arrives-before-v2-the-case-studys-example): v3 is applied, v2 is stale, and the employee ends on v3's office and shift.
+- **How it's tested.**
+  - [`ExampleUseCaseIT.transferV7BeforeShiftV6`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java): the case study's example with its values
+  - [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java): 32 threads send versions 1–200 shuffled for one employee: final version 200, each version applied once, nothing lost. Without the lock it fails
+  - [`ApplyServiceIT.staleIgnored`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java)
+  - Run: `./mvnw verify -Dit.test='ExampleUseCaseIT,ConcurrentApplyIT' -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 4. HR and the transport team edit the same employee
+
+- **What goes wrong.** The transport team sets Asha's pickup point to "Gate 2". The next routine HR update carries an old pickup point and overwrites it, so the cab waits at the wrong gate. Or two transport admins edit at once, and one silently overwrites the other.
+- **How we solved it: the conflict rule.**
+  1. Every field has exactly one owner. **HR owns** name, email, phone, manager, office, shift and status. **The transport team owns** pickup point and special assistance.
+  2. Only the owner can change a field. HR changes and transport edits use **separate database statements**, so HR's statement cannot even name a transport column.
+  3. Each owner has its own version (`hr_version`, `transport_version`), so a transport edit never makes HR's next update look old, or the reverse.
+  4. A transport field inside an HR update is ignored and counted (`hr_owned_field_violation_total`); the rest of the update applies. An admin trying to change an HR field gets `400 FIELD_NOT_OWNED`.
+  5. A transport edit must say which version it was based on (`If-Match` header); if someone changed it meanwhile, it gets `412` and nothing changes. There is no "last write wins".
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Ownership by separate write paths | It can't be forgotten in the next new feature | `if` checks spread through the code |
+  | Hand-written SQL for writes; the ORM (JPA) only for reads | JPA saves every mapped column, which would let HR write transport columns | Saving entities through JPA |
+  | Ignore (and count) foreign fields from HR, but reject them from the admin | HR feeds are machines; blocking a valid record over an extra field would hold up real changes. An admin is a person who can fix the request | Rejecting both |
+  | Optimistic `If-Match` for admin edits | Human edits are rare and slow; holding a lock while someone thinks is wrong | Locks for admin edits |
+- **See it yourself.** [Tour step 5](docs/curl-examples.md#5-field-ownership-hr-vs-the-transport-admin).
+- **How it's tested.**
+  - [`ApplyServiceIT.hrCannotOverwriteTransportFields`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java)
+  - [`EmployeeRepositoryIT.hrWritesNeverTouchTransportColumns`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/EmployeeRepositoryIT.java): checked at the database level
+  - [`IngestControllerIT.transportFieldsInAnHrPayloadAreIgnoredAndCounted`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java)
+  - [`TransportPatchIT`](src/test/java/com/moveinsync/rostersync/api/employee/TransportPatchIT.java): `If-Match`, `412`, `428`, `FIELD_NOT_OWNED`
+  - [`FieldOwnershipPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/FieldOwnershipPolicyTest.java): the field → owner table
+  - Run: `./mvnw verify -Dit.test=TransportPatchIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 5. Comparing 200,000 employees every night without running out of memory
+
+- **What goes wrong.** The simple way loads the file and the database into memory and compares them. With 200,000 rows on each side, that needs hundreds of megabytes per client, and it grows with every client.
+- **How we solved it.**
+  - **Pass 1** reads the file one line at a time. Each line is validated, fingerprinted (hash of its HR fields), and written to one of **64 small temporary files** ("buckets"), chosen by a hash of the employee id. Each employee's bucket number is also stored in the database.
+  - **Pass 2** takes one bucket at a time: about 3,000 rows from the file and the same bucket from the database (an indexed query). It compares them:
+
+| File row | Stored employee | Plan |
+|---|---|---|
+| valid, not stored | – | `CREATE` |
+| newer version, different content | any | `UPDATE` |
+| same version, same content | any | nothing |
+| same version, different content | any | conflict: reported, nothing changed |
+| older version | any | nothing (the live feed is ahead) |
+| missing | `ACTIVE`, last HR change at or before the file's `as_of` | `DEACTIVATE` |
+| invalid (bad phone, cut-off line…) | any | nothing; **the employee counts as present** |
+
+  - The result is a **plan**: who to create, update or deactivate, plus every bad line by line number and error code. The temporary files are deleted.
+  - The plan is applied through the **same** code as live changes, with the same locks and version rule, so a file taken at 02:00 can never overwrite a live change made at 02:05.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | 64 hash buckets, two passes | Only one bucket is in memory at a time: memory stays flat as files grow | Two full in-memory maps; sorting both sides |
+  | Compare fingerprints, not fields | "Has anything changed?" becomes a 32-byte comparison | Comparing nine fields per row |
+  | Plan first, apply later | The safety brake (next problem) needs the full picture before anything happens | Applying while reading |
+  | An invalid line counts as "present" | A typo in the file isn't evidence that someone left | Treating it as missing |
+  | A missing employee is deactivated only if nothing changed since the file was taken, and keeps HR's version number | The live feed keeps running; an old file must never undo a newer live change, and HR's next real version must still apply | Inventing a new version for "missing" |
+- **See it yourself.** [Tour step 9](docs/curl-examples.md#9-the-nightly-file-a-normal-night). For a 200,000-row file: `scripts/generate-export.sh --rows 200000` (needs JDK 21), then upload it as in the [API reference](#nightly-reconciliation).
+- **How it's tested.**
+  - [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java): 200,000 stored employees vs a 201,000-row file: plan in 3.0 s, plan + apply in 24.9 s, 127 MB peak on a 256 MB heap
+  - [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java): every row of the comparison table
+  - [`ReconciliationPlannerIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlannerIT.java): only changes are planned, bad lines recorded by number and code, temporary files deleted
+  - [`ReconciliationIT.approvalLaterStillRespectsLiveChangesMadeInBetween`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationIT.java)
+  - Run: `./mvnw verify -Pbenchmark` (only the benchmark, on a 256 MB heap; results in `target/benchmark/reconciliation.txt`)
+
+### 6. A broken nightly file must not deactivate thousands of people
+
+- **What goes wrong.** The case study's example: the file stops at row 120,000 of 200,000. Treated as complete, it says 80,000 people have left: their accounts are deactivated and their cabs cancelled.
+- **How we solved it: the safety brake.**
+  - The file has a header (client and the time the snapshot was taken) and a **trailer** stating how many rows it holds (`#TRAILER,count=200000`). A missing or wrong trailer means the file was cut off.
+  - Before anything is applied, the brake looks at the finished plan:
+    - **`FILE_TRUNCATED`**: the trailer is missing or wrong. This trips even if nobody would be deactivated, because the file can't be trusted.
+    - **`MISSING_RATIO_EXCEEDED`**: planned deactivations ÷ active employees ≥ the threshold. The default is **30 %**, configurable as `rostersync.reconciliation.brake-threshold`.
+  - When it trips, **nothing** from the file is applied, creates and updates included. The run waits (`AWAITING_APPROVAL`), a metric goes up, and the Prometheus alert **ReconciliationBrakeTripped** fires.
+  - An operator looks at the numbers (how many would be deactivated, which lines were broken) and **approves** or **rejects**. On approval, every change is re-checked against live data. Deciding twice is refused (`409`).
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Hold the whole plan, not only the deactivations | A cut-off or wrong file is suspect in every row; half a plan matches neither the file nor yesterday | Applying creates and updates anyway |
+  | A trailer with the row count | A truncated file otherwise looks like a smaller file | Trusting the row count |
+  | Exact decimal arithmetic for the ratio | In floating point, 30 % of 10 isn't exactly 3, so the boundary would be wrong | `double` |
+  | Upload returns at once (`202`), work runs in the background, one run at a time | A large file shouldn't hold a web request open; two runs at once would plan against changing data | Processing inside the request |
+- **See it yourself.** [Tour steps 10–11](docs/curl-examples.md#10-the-file-is-cut-off-the-safety-brake): a cut-off file is held and rejected; a file dropping almost half the staff is held and approved. Then open http://localhost:9090/alerts.
+- **How it's tested.**
+  - [`ExampleUseCaseIT.truncatedFileAt120kDeactivatesNobody`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java): 200,000 employees, file cut at row 120,000 mid-line: held as `FILE_TRUNCATED`, 79,999 planned, **nobody** deactivated, even after rejection
+  - [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java): thresholds and the exact 30 % boundary
+  - [`BrakeThresholdConfigIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/BrakeThresholdConfigIT.java): the threshold comes from configuration
+  - [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java): upload, approve, reject, deciding twice, roles
+  - [`alerts.test.yml`](ops/prometheus/alerts.test.yml): the alert fires on a client's first trip and resolves
+  - Run: `./mvnw verify -Dit.test=ExampleUseCaseIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` · `scripts/check-alerts.sh`
+
+### 7. Every change must reach downstream systems, even across a crash
+
+- **What goes wrong.** The obvious code saves the change, then sends a message to other systems (such as bookings). If the process dies in between, the change is saved but nobody hears about it. Sending first is worse: a message about a change that was then rolled back.
+- **How we solved it: the transactional outbox.**
+  - The change and a row in an `outbox` table are saved in **one** database transaction: both or neither.
+  - A background relay sends unsent rows to Kafka in order, keyed by employee so each employee's events stay in order. It marks a row sent **only after the broker confirms** it.
+  - A crash before sending leaves the row unsent, and it's sent after restart. A crash after sending but before marking sends it twice, and consumers recognise the duplicate by its event id. Delivered at least once, acted on exactly once.
+  - Only one relay is active at a time (a database advisory lock), and a failed send stops the batch, so no later event for an employee can overtake an earlier one.
+  - If Kafka is down, saving changes continues; events wait in the outbox and drain in order later.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Outbox + relay | The only way to make "save" and "tell others" atomic without a distributed transaction | Save then send; Kafka transactions (they don't include the database) |
+  | Polling relay | Simple to run; enough throughput here (≈ 7,000 events/s) | Change data capture (Debezium): no polling, but another service to operate |
+  | One active relay, stop at the first failure | Keeps each employee's events in order | Several relays skipping locked rows: they could reorder an employee's events |
+  | Send in groups where no employee repeats | The load test showed one-at-a-time sending managed only 137 events/s; groups reach ≈ 7,000 with the same ordering | Sending a whole batch at once, which could reorder an employee's events on failure |
+  | Events carry ids, versions and the *names* of changed fields, not values | Brokers keep messages and copy them to every consumer; personal data stays behind the API | Full records in events |
+- **See it yourself.** Stop the broker (`docker compose stop redpanda`), send an update (still `APPLIED`), watch "Outbox: oldest unsent" rise on the dashboard, then `docker compose start redpanda` and watch it drain. Or kill the app mid-traffic: `docker compose kill app`, then `docker compose up -d --wait app`.
+- **How it's tested.**
+  - [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java): **the process crashes between the database write and the publish**, before and after the broker received it; the effect still happens exactly once
+  - [`OutboxIT.eventWrittenInSameTransaction`](src/test/java/com/moveinsync/rostersync/OutboxIT.java): a failing event write leaves no employee change behind
+  - [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java): a broker outage: ingest continues, the backlog drains in order
+  - [`OutboxRelayIT`](src/test/java/com/moveinsync/rostersync/application/OutboxRelayIT.java): order per employee, stop at the first failure, one active relay, at most one event per employee in flight
+  - Run: `./mvnw verify -Dit.test='OutboxCrashRecoveryIT,BrokerDownIT' -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 8. People who leave must lose their cab bookings
+
+- **What goes wrong.** A cab waits at the pickup point of someone who left last week, and the seat can't go to anyone else.
+- **How we solved it.**
+  - The booking side listens for `EMPLOYEE_DEACTIVATED` events.
+  - In one transaction it records the event id, cancels the person's bookings on trips that haven't started, and frees one seat per cancelled booking. Past trips stay as history.
+  - If the event id was already handled, it does nothing.
+  - Failures are retried with growing pauses for up to ten minutes.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | React to the change event, separately from saving the change | Bookings are a different part of the business; ingest stays fast | Cancelling inside the HR change's transaction |
+  | Remember handled event ids | A *late* copy of an old exit, arriving after the person was rehired and booked again, would otherwise cancel the new booking | Relying on cancellation being repeatable |
+  | Cancel and free seats in one SQL statement | The two can never get out of step | Two separate updates |
+- **See it yourself.** [Tour step 8](docs/curl-examples.md#8-an-exit-cancels-the-cab-booking-change-events).
+- **How it's tested.**
+  - [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java): future cancelled, past kept, seats exact, redelivery ignored, `lateCopyOfAnOldExitDoesNotCancelBookingsMadeAfterRehire` (fails without the event-id check)
+  - [`BookingApiIT.anExitSentByHrCancelsTheBookingEndToEnd`](src/test/java/com/moveinsync/rostersync/api/booking/BookingApiIT.java): through the real API, outbox and broker
+  - Run: `./mvnw verify -Dit.test=DeactivationConsumerIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 9. Personal data must never leak
+
+- **What goes wrong.** Error messages and logs end up in many places: log storage, alert emails, support tickets. If they contain names, phone numbers or pickup addresses, that's a data leak.
+- **How we solved it.**
+  - Logs are JSON lines with a trace id, client id and employee id, never field values.
+  - Errors return a stable `code`, a trace id, and for validation the field *names*.
+  - Exception messages are never copied into a response or log, because a database error message can contain the rejected value.
+  - Objects holding personal data print only field names.
+  - Metric labels are client ids, outcomes and codes.
+  - A broken line in a nightly file is reported by line number and code only.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Report *where* and *what kind*, never *what* | Line number + code + employee id is enough to fix it; the value stays in the database under access control | Echoing the bad value back |
+  | Prove it with a test that searches everything | Rules like this break quietly in new code | Reviewing by hand |
+- **How it's tested.**
+  - [`NoPiiInLogsIT`](src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java): pushes distinctive fake names, emails, phones and addresses through every flow (valid and invalid, live and nightly, through the broker), then searches all log output, the metrics and every error body. It found and fixed one real leak: a garbled file line starting with a name
+  - [`IngestControllerIT.errorReportContainsNoPersonalData`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java)
+  - [`GlobalExceptionHandlerTest`](src/test/java/com/moveinsync/rostersync/api/GlobalExceptionHandlerTest.java): no exception message ever reaches a response
+  - Run: `./mvnw verify -Dit.test=NoPiiInLogsIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 10. One client must never see another client's data, and each person only what their role allows
+
+- **What goes wrong.** Client A's admin types client B's employee id into the URL and sees their data. Or the HR system, a machine, is given admin rights and edits pickup points.
+- **How we solved it.**
+  - Every request carries a signed token (JWT) naming the caller, their client (tenant) and their roles.
+  - The client is taken **only** from the token, never from the URL or body.
+  - Every table key starts with the client id, and every database method requires it.
+  - Roles: `HR_INTEGRATION` (the HR system), `ADMIN` (transport admin), `OPERATOR` (nightly runs), `EMPLOYEE` (own record only). Any endpoint not explicitly allowed is denied.
+  - Another client's employee answers **`404`**, exactly like an id that doesn't exist, so the request doesn't even confirm the record exists.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Client only from the token | Nothing in the request can switch clients | A client id in the URL or a header |
+  | `404`, not `403`, across clients | A `403` would confirm the record exists | `403` |
+  | A separate role for the HR system | It's a machine; `ADMIN` would let it edit transport fields | Reusing `ADMIN` |
+  | Deny by default | A new endpoint is closed until someone decides who may use it | Allow by default |
+  | HS256 demo tokens from `/dev/token`, demo profile only | Easy local evaluation; production uses tokens from the company's identity provider | — |
+- **See it yourself.** [Tour step 6](docs/curl-examples.md#6-another-tenant-404-exactly-like-an-id-that-doesnt-exist).
+- **How it's tested.**
+  - [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java): `anotherTenantsEmployeeLooksExactlyLikeAMissingOne`
+  - [`SecurityIT`](src/test/java/com/moveinsync/rostersync/api/security/SecurityIT.java): missing, expired, forged and client-less tokens → 401; wrong role → 403; unknown paths denied
+  - [`ReconciliationApiIT.rolesAreEnforced`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java)
+  - [`DevTokenAbsentIT`](src/test/java/com/moveinsync/rostersync/api/security/DevTokenAbsentIT.java): `/dev/token` doesn't exist without the demo or dev profile
+  - Run: `./mvnw verify -Dit.test='TenantIsolationIT,SecurityIT' -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
+
+### 11. On-call must see trouble at 3 AM
+
+- **What goes wrong.** The broker has been down for an hour, a client started sending broken records, or last night's file is waiting for approval, and nobody knows until employees complain.
+- **How we solved it.**
+  - The service exposes the numbers on-call needs: records by outcome and error code, ingest lag, retries, outbox depth and oldest unsent age, publish failures, consumer lag, nightly-run duration, brake trips, cache hits.
+  - Prometheus collects them, Grafana shows them, and five alert rules page someone: brake tripped, outbox not draining, rejection spike, ingest lag, app down.
+  - Every alert rule has its own unit test.
+  - Logs are structured JSON with a trace id, which is also returned to the caller.
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Alert on symptoms someone must act on | CPU and memory are dashboard material, not pages | Alerting on resource usage |
+  | Outbox depth read from the table when scraped | Correct across restarts and multiple instances | In-memory counters |
+  | Labels: client, outcome, code only | Bounded series; nothing client-supplied or personal | Labelling by source system or employee id |
+- **See it yourself.** http://localhost:3000 after the tour; details in [Monitoring](#monitoring--what-on-call-sees-at-3-am).
+- **How it's tested.**
+  - [`MetricsIT`](src/test/java/com/moveinsync/rostersync/MetricsIT.java): real traffic, then every series on `/actuator/prometheus`; other actuator endpoints stay closed
+  - [`alerts.test.yml`](ops/prometheus/alerts.test.yml): every alert fires and resolves as specified, including "one rejection in a quiet hour is not a spike"
+  - [`StructuredLoggingIT`](src/test/java/com/moveinsync/rostersync/StructuredLoggingIT.java): JSON logs with trace id
+  - Run: `./mvnw verify -Dit.test=MetricsIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` · `scripts/check-alerts.sh`
+
+### 12. It must stay fast, and reads must not hammer the database
+
+- **What goes wrong.** Validating a 1,000-record batch or a 200,000-row file looks up the same office codes thousands of times; admin screens re-read the same employees.
+- **How we solved it.**
+  - Two small in-memory caches:
+    - active office codes per client, 5 minutes;
+    - employee records for the read screens, 30 seconds, dropped by this server after every change it makes.
+  - **Writes and version checks never use a cache**: they always lock and read the row.
+  - The throughput is measured, not claimed: [Performance and cost](#performance-and-cost).
+- **Decisions we made.**
+
+  | Decision | Why | Not chosen |
+  |---|---|---|
+  | Cache only "this office is active", never "unknown" | A newly created office is accepted at once; only a deactivated one can linger (≤ 5 min) | Caching both answers |
+  | Caches only on read paths | A stale read can show old data for ≤ 30 s, but can never cause a wrong write (a stale `If-Match` gets `412`) | Caching inside writes |
+  | In-process caches | No extra service; staleness is bounded and stated | A shared cache (Redis) |
+- **How it's tested.**
+  - [`OfficeCacheTest`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/OfficeCacheTest.java): hits, expiry at exactly 5 minutes, "unknown" not cached, clients kept apart (with a fake clock)
+  - [`EmployeeReadCacheIT`](src/test/java/com/moveinsync/rostersync/api/employee/EmployeeReadCacheIT.java): own changes visible at once; a stale ETag gets `412`
+  - [`loadtest/ingest.js`](loadtest/ingest.js): k6: 5,858 records/s, p99 556 ms per 50-record batch
+  - Run: `./mvnw test -Dtest=OfficeCacheTest` · `scripts/loadtest.sh` (against the running stack)
 
 ## How it works — the big picture
 
@@ -256,210 +677,243 @@ sequenceDiagram
 2. A crash between publishing and marking sends it twice, and consumers keep a list of handled event ids. The result: delivered at least once, acted on exactly once.
 3. Proof: [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java) (both crash points). For a real container kill: `docker compose kill app`, then `docker compose up -d --wait app`. The data is intact and the outbox drains.
 
-## The rules, explained
+## API reference: every route
 
-Each rule from the case study: what it says, what goes wrong without it, how it is solved, why this way, and the test that proves it.
+All endpoints take and return JSON and need a bearer token, except `/dev/token` and the two actuator endpoints. The client (tenant) comes from the token, never from the URL or body. In the examples, `$HR`, `$ADMIN`, `$OPS` are tokens from `/dev/token` (see [Run it](#run-it-in-5-minutes)); every request with its real output is in [docs/curl-examples.md](docs/curl-examples.md), and all of them are in the [Postman collection](docs/postman_collection.json).
 
-### Validate at the boundary; one bad record never fails a batch
+| Method and path | Who may call | Purpose |
+|---|---|---|
+| `POST /api/v1/hr/events:batch` | `HR_INTEGRATION` | Up to 1,000 HR events, a result per record |
+| `GET /api/v1/employees/{id}` | `ADMIN` | One employee; `ETag` = transport version |
+| `GET /api/v1/employees/me` | `EMPLOYEE` | Own record (id from the token) |
+| `PATCH /api/v1/employees/{id}/transport` | `ADMIN` | Pickup point and special assistance; `If-Match` required |
+| `POST /api/v1/bookings` | `ADMIN` | Book a seat on a trip |
+| `GET /api/v1/bookings?employeeId=` | `ADMIN` | An employee's bookings |
+| `POST /api/v1/reconciliations` | `HR_INTEGRATION`, `OPERATOR` | Upload a nightly file |
+| `GET /api/v1/reconciliations/{id}` | `OPERATOR` | A nightly run and its numbers |
+| `GET /api/v1/reconciliations/{id}/errors` | `OPERATOR` | The run's bad lines |
+| `POST /api/v1/reconciliations/{id}/approve` | `OPERATOR` | Apply a held run |
+| `POST /api/v1/reconciliations/{id}/reject` | `OPERATOR` | Discard a held run |
+| `POST /dev/token` | anyone, **demo/dev profile only** | A token for any demo identity |
+| `GET /actuator/health`, `GET /actuator/prometheus` | anyone | Health; metrics |
 
-- **The rule.** Reject invalid records (malformed phone, unknown office code, missing fields) with a per-record error report. One bad record must never fail a whole batch.
-- **Without it.** A typo in one of 100 joiners blocks the other 99 from getting a cab until someone fixes the file, or a malformed phone number is stored and the driver cannot call.
-- **How.**
-  - The batch endpoint keeps each event as raw JSON until it is that record's turn, so even a wrongly typed field rejects only its own record.
-  - Each record is validated by a chain of validators ([`CompositeValidator`](src/main/java/com/moveinsync/rostersync/domain/validation/CompositeValidator.java)):
-    - required fields;
-    - email shape;
-    - phone in canonical E.164, checked with Google's libphonenumber;
-    - office code known for this client.
-  - Each valid record is applied in **its own database transaction** ([`ApplyService`](src/main/java/com/moveinsync/rostersync/application/ApplyService.java)).
-  - The response is `200` with one result per record: index, employee id, outcome, and an error code for rejections.
-- **Why this way.** Wrapping the whole batch in one transaction would let a single database error roll back 99 good records. Per-record transactions cost more round trips but make every record independent.
-- **Proof.**
-  - [`IngestControllerIT.oneBadRecordDoesNotFailBatch`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java): 1 bad phone in 100 → 99 applied, 1 rejected with `INVALID_PHONE`.
-  - `wronglyTypedFieldRejectsOnlyItsRecord`.
-  - [`CompositeValidatorTest`](src/test/java/com/moveinsync/rostersync/domain/validation/CompositeValidatorTest.java).
+Errors common to every protected route: `401 UNAUTHENTICATED` (missing, expired, forged or client-less token), `403 FORBIDDEN` (wrong role), `415 UNSUPPORTED_MEDIA_TYPE`, `405 METHOD_NOT_ALLOWED`. Tested in [`SecurityIT`](src/test/java/com/moveinsync/rostersync/api/security/SecurityIT.java) and [`GlobalExceptionHandlerTest`](src/test/java/com/moveinsync/rostersync/api/GlobalExceptionHandlerTest.java).
 
-### Per-employee order, idempotency key and version comparison
+### `POST /api/v1/hr/events:batch`
 
-- **The rule.** Apply changes per employee in version order; a stale update is ignored and a duplicate is a no-op. Define the idempotency key and the version comparison.
-- **Without it.** A retry is applied twice, or an older shift change that arrives late overwrites a newer transfer, and the employee is sent to the wrong office.
-- **How.** Every event carries the source system's per-employee `version` and the employee's **full** HR-owned state, not just the changed field. Inside a transaction that locks the employee's row (`SELECT … FOR UPDATE`), [`VersionPolicy`](src/main/java/com/moveinsync/rostersync/domain/VersionPolicy.java) decides:
+```bash
+curl -s -X POST localhost:8080/api/v1/hr/events:batch -H "Authorization: Bearer $HR" -H 'Content-Type: application/json' -d '{
+  "sourceSystem": "workday",
+  "events": [
+    { "type": "UPDATE", "employeeId": "E000042", "version": 7, "occurredAt": "2026-10-30T08:00:07Z",
+      "firstName": "Asha", "lastName": "Rao", "email": "asha@acme.example", "phone": "+919876543210",
+      "managerId": "E000001", "officeCode": "HYD-02", "shiftCode": "NIGHT" },
+    { "type": "DEACTIVATE", "employeeId": "E000043", "version": 12, "occurredAt": "2026-10-30T09:00:00Z" }
+  ]}'
+```
+```json
+{ "results": [
+  { "index": 0, "employeeId": "E000042", "outcome": "APPLIED" },
+  { "index": 1, "employeeId": "E000043", "outcome": "REJECTED", "errorCode": "UNKNOWN_EMPLOYEE" } ] }
+```
+- `type`: `CREATE`, `UPDATE` or `DEACTIVATE`. A `DEACTIVATE` may carry only the header, as above, or the full record. The full record is recommended: then an exit that arrives before any other event is still recorded.
+- `200` always, with one result per record. `outcome`: `APPLIED`, `DUPLICATE`, `STALE` or `REJECTED`.
+- Per-record codes:
+  - `MALFORMED_RECORD`, `INVALID_EVENT_TYPE`, `MISSING_REQUIRED_FIELD`, `INVALID_VERSION`;
+  - `INVALID_EMAIL`, `INVALID_PHONE`, `UNKNOWN_OFFICE`, `UNKNOWN_EMPLOYEE`;
+  - `VERSION_CONFLICT`;
+  - `PROCESSING_FAILED` (nothing written, safe to resend).
+- Request-level errors: `400 MALFORMED_REQUEST` (unreadable JSON), `400 INVALID_REQUEST` with `fields` (missing `sourceSystem` or `events`, or more than 1,000 events).
+- Tested in [`IngestControllerIT`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java) and [`ApplyServiceIT`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java).
 
-  | Stored | Incoming | Decision | Effect |
-  |---|---|---|---|
-  | nothing | any | APPLY | create the employee |
-  | v | > v | APPLY | write HR fields, record the change |
-  | v | = v, same content hash | DUPLICATE | nothing written |
-  | v | = v, different content hash | REJECTED `VERSION_CONFLICT` | nothing written |
-  | v | < v | STALE | nothing written |
+### `GET /api/v1/employees/{id}` and `GET /api/v1/employees/me`
 
-  - **Idempotency key:** `(tenant_id, source_system, employee_id, version)`. The database enforces it with a unique key on the applied-event log.
-  - **Content hash:** SHA-256 of the employee's HR state, in a fixed encoding.
-  - **Defence in depth:** the write itself is conditional: `UPDATE … WHERE hr_version < :incoming`.
-- **Why this way.**
-  - Because events carry full state, "accept only newer versions" gives the same end result as applying every event in order, without queues or reordering buffers.
-  - The lock serialises events for one employee only; different employees proceed in parallel.
-  - The case study's example: a transfer (v7) arrives before a shift change (v6). v6 is stale, and the employee ends up in the new office with the v7 shift, which already contains the v6 change.
-- **Proof.**
-  - [`ExampleUseCaseIT.transferV7BeforeShiftV6`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java).
-  - [`ApplyServiceIT`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java): `staleIgnored`, `duplicateIsNoOp`, `sameVersionWithDifferentContentIsRejectedAsConflict`.
-  - [`ReplayFeedTwiceIT`](src/test/java/com/moveinsync/rostersync/ReplayFeedTwiceIT.java): a shuffled 1,000-event feed sent twice; after the second run every row, column by column including timestamps, and the change log are identical.
-  - [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java): 32 threads, versions 1–200 shuffled → final version 200, no version applied twice, no lost update. Without the lock and the conditional update this test fails.
+```bash
+curl -s -i localhost:8080/api/v1/employees/E000042 -H "Authorization: Bearer $ADMIN"
+```
+- `200` with the record, and `ETag: "<transport version>"`, which a transport edit must send back as `If-Match`.
+- `/me` (role `EMPLOYEE`) returns the caller's own record; the id is the token's subject.
+- `404 NOT_FOUND` for an unknown id **or** one belonging to another client. An `EMPLOYEE` asking for `/employees/{id}` gets `403`.
+- Tested in [`EmployeeReadIT`](src/test/java/com/moveinsync/rostersync/api/employee/EmployeeReadIT.java) and [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java).
 
-### Field ownership and the conflict rule
+### `PATCH /api/v1/employees/{id}/transport`
 
-- **The rule.** HR owns name, email, manager and office; the transport admin owns pickup point and special-assistance needs. An HR update never overwrites a transport-owned field, and the conflict rule is written down.
-- **Without it.** A routine HR update wipes the pickup point the transport admin set, and the cab goes to the wrong address.
-- **The conflict rule.**
-  1. Every field has exactly one owner ([`EmployeeField`](src/main/java/com/moveinsync/rostersync/domain/EmployeeField.java)). Phone, shift and status come from the HR system and are HR-owned (an assumption: the case study lists only name, email, manager and office).
-  2. Only the owner's write path changes a field, and each owner has its own version (`hr_version`, `transport_version`), so neither can make the other's updates look stale.
-  3. A value for a field the writer does not own is ignored and counted (`hr_owned_field_violation_total`); the rest of the record is still applied.
-  4. There is no "last write wins" across owners.
-- **How.** The HR update statement names only HR columns and the transport update only transport columns. Writes never go through the ORM, whose change tracking would write every column.
-- **Proof.**
-  - [`ApplyServiceIT.hrCannotOverwriteTransportFields`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java).
-  - [`IngestControllerIT.transportFieldsInAnHrPayloadAreIgnoredAndCounted`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java).
-  - [`EmployeeRepositoryIT.hrWritesNeverTouchTransportColumns`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/EmployeeRepositoryIT.java).
-  - [`FieldOwnershipPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/FieldOwnershipPolicyTest.java).
+```bash
+curl -s -i -X PATCH localhost:8080/api/v1/employees/E000042/transport -H "Authorization: Bearer $ADMIN" \
+  -H 'If-Match: "0"' -H 'Content-Type: application/json' -d '{"pickupPoint":"Gate 2, Tech Park"}'
+```
+- `200` with the record and the new `ETag: "1"`. A field left out keeps its value; a field sent as `null` is cleared.
+- `428 PRECONDITION_REQUIRED` without `If-Match`.
+- `412 TRANSPORT_VERSION_MISMATCH` if someone edited first. Nothing changes.
+- `400 FIELD_NOT_OWNED` for an HR-owned field (such as `officeCode`); `400 INVALID_REQUEST` for an unknown field. Both list the field names.
+- `404` for an unknown employee or another client's.
+- Tested in [`TransportPatchIT`](src/test/java/com/moveinsync/rostersync/api/employee/TransportPatchIT.java).
 
-### No personal data in logs or error reports
+### `POST /api/v1/bookings` and `GET /api/v1/bookings?employeeId=`
 
-- **The rule.** Never write personal data into logs or error reports; use employee ids.
-- **How.**
-  - Logs are JSON lines carrying `traceId`, `tenantId` and `employeeId` as fields.
-  - Error responses carry a stable `code` and the `traceId`, plus field *names* for validation errors.
-  - Exception messages are never copied into a response or a log line, because a database message can contain the very value it rejected.
-  - `toString()` of every domain object that holds personal data lists field names only.
-  - Metric labels are tenant ids, outcomes and codes. Change events carry field *names*, not values.
-  - A broken line in a nightly file is reported by line number and code. Its first field is not reported as an employee id, because a garbled line can start with a name.
-- **Proof.**
-  - [`IngestControllerIT.errorReportContainsNoPersonalData`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java).
-  - [`GlobalExceptionHandlerTest`](src/test/java/com/moveinsync/rostersync/api/GlobalExceptionHandlerTest.java).
-  - The domain `toString` tests.
-  - [`NoPiiInLogsIT`](src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java) runs every flow that handles personal data with distinctive values, valid and invalid. It covers ingest with every rejection type, transport edits, a booking cancelled by an exit through the broker, and a nightly file with garbled lines. It then searches all log output (background threads included), the metrics scrape and every error body for those values. This test found the garbled-line case above.
-
-### Reliable change events (the outbox)
-
-- **The rule.** Publish a change event for every applied change using the outbox pattern, so the database update and the event can never disagree.
-- **Without it.** The obvious code saves the employee and then sends the event. If the process dies in between, the employee is marked as left but nobody downstream hears about it, and their cab bookings stay. Sending first and saving second fails the other way: an event for a change that was rolled back.
-- **How.**
-  - In **the same database transaction** as the employee update, a row is written to the `outbox` table ([`ApplyService`](src/main/java/com/moveinsync/rostersync/application/ApplyService.java), [`JdbcOutbox`](src/main/java/com/moveinsync/rostersync/infrastructure/persistence/JdbcOutbox.java)). Both commit or neither does, and the outbox refuses a write outside a transaction.
-  - A background relay ([`OutboxRelay`](src/main/java/com/moveinsync/rostersync/application/OutboxRelay.java)) runs every 200 ms:
-    - it locks up to 100 unsent rows in order (`FOR UPDATE SKIP LOCKED`);
-    - it sends each to the topic `rostersync.employee-changes`, keyed by `tenant:employee` so each employee's events stay in order;
-    - it **waits for the broker's acknowledgement** before marking the row sent.
-  - On a failure it records the attempt, **stops the batch** so no later event overtakes an earlier one, and backs off exponentially, up to 10 s.
-  - A Postgres advisory lock keeps exactly one relay active across instances. Skipping locked rows alone would let a second instance send an employee's newer event while the first retries an older one.
-  - Events carry ids, versions, status and the *names* of the changed fields, never their values. A consumer that needs details asks the API.
-- **Why this way.**
-  - Delivery is **at least once**: a crash after sending but before marking means the event is sent again.
-  - Consumers turn that into an **exactly-once effect** by remembering event ids.
-  - Exactly-once *delivery* across a database and a broker would need a distributed transaction. Reading the database's change log (CDC, e.g. Debezium) would avoid polling but adds a connector service to run.
-- **Proof.**
-  - [`OutboxIT.eventWrittenInSameTransaction`](src/test/java/com/moveinsync/rostersync/OutboxIT.java): a failing event write leaves no employee change behind. The same class shows duplicates and stale records write no event.
-  - [`OutboxRelayIT`](src/test/java/com/moveinsync/rostersync/application/OutboxRelayIT.java): order per key, stop at the first failure, one active relay.
-  - [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java): **the process dies between the database write and the publish**, both before and after the broker received the event, and the effect still happens exactly once.
-  - [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java): while the broker is down, updates keep being accepted and the backlog drains in order afterwards.
-
-### Deactivation side effects
-
-- **The rule.** An employee who leaves has their future cab bookings cancelled and their seat freed.
-- **Without it.** A cab waits at the pickup point of someone who no longer works there, and the seat cannot be given to anyone else.
-- **How.**
-  - A consumer of the change topic ([`EmployeeChangeListener`](src/main/java/com/moveinsync/rostersync/infrastructure/messaging/EmployeeChangeListener.java) → [`DeactivationHandler`](src/main/java/com/moveinsync/rostersync/application/DeactivationHandler.java)) reacts to `EMPLOYEE_DEACTIVATED`.
-  - In one transaction it records the event id in `processed_message`. If the id is already there, it does nothing.
-  - Otherwise it cancels the employee's bookings on trips that have not started and frees one seat per cancelled booking. Both happen in a single SQL statement, so they cannot get out of step.
-  - Bookings on trips that already ran are left as history.
-  - A failing side effect is retried with growing pauses for up to ten minutes.
-- **Why the event id check matters.** Cancelling is mostly idempotent on its own, since a second run finds nothing still booked. The dangerous case is a **late copy** of an old exit that arrives after the person was rehired and booked again. Without the check it would cancel the new booking.
-- **Proof.**
-  - [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java), including `lateCopyOfAnOldExitDoesNotCancelBookingsMadeAfterRehire`. That test fails if the check is removed.
-  - [`BookingApiIT.anExitSentByHrCancelsTheBookingEndToEnd`](src/test/java/com/moveinsync/rostersync/api/booking/BookingApiIT.java).
+```bash
+curl -s -X POST localhost:8080/api/v1/bookings -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"tripId":"T-ACME-1","employeeId":"E000042"}'
+curl -s "localhost:8080/api/v1/bookings?employeeId=E000042" -H "Authorization: Bearer $ADMIN"
+```
+- These are minimal, there to show what an exit does to bookings. `POST` → `201` with the booking; `GET` lists bookings with status and cancel reason.
+- `409`: `TRIP_FULL`, `TRIP_DEPARTED`, `EMPLOYEE_INACTIVE` or `ALREADY_BOOKED`. `404` for an unknown trip or employee, or another client's.
+- Tested in [`BookingApiIT`](src/test/java/com/moveinsync/rostersync/api/booking/BookingApiIT.java).
 
 ### Nightly reconciliation
 
-- **The rule.** Every night HR sends the full list of employees. Compare it with what we hold and fix the differences: create the employees we do not have, update the ones that changed, deactivate the ones that are gone.
-- **Without care.** The simple version loads 200,000 file rows and 200,000 database rows into two maps. That needs hundreds of megabytes and grows with every client. Worse, it treats "not in the file" as "left the company", so a file that was cut short would deactivate everyone after the cut.
-- **The file.** A header names the client and the moment the export was taken, and a trailer states how many rows it holds:
-  ```
-  #HEADER,tenant=acme,as_of=2026-10-30T02:00:00Z
-  employee_id,version,first_name,last_name,email,phone,manager_id,office_code,shift_code,status
-  E000001,12,…,ACTIVE
-  #TRAILER,count=200000
-  ```
-  A file without the trailer, or with a wrong count, is treated as cut short.
-- **How: plan first, in two passes, then apply.** [`ReconciliationPlanner`](src/main/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlanner.java):
-  1. **Pass 1** streams the file one row at a time ([`ExportReader`](src/main/java/com/moveinsync/rostersync/application/reconciliation/ExportReader.java)). It validates each row with the same validators as the API, hashes its HR state, and appends a short line to one of 64 temporary bucket files. The bucket is `floorMod(murmur3(employee_id), 64)`, the same value stored in `employee.bucket`.
-  2. **Pass 2** takes one bucket at a time. It loads that bucket's file rows (about 3,000) and the matching database rows (`WHERE tenant_id = ? AND bucket = ?`, indexed), then compares them ([`ReconciliationDiffer`](src/main/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDiffer.java)):
-     | File row | Stored employee | Plan |
-     |---|---|---|
-     | valid, not stored | – | `CREATE` |
-     | newer version, different hash | any | `UPDATE` |
-     | same version, same hash | any | nothing |
-     | same version, different hash | any | conflict, reported, nothing changed |
-     | older version | any | nothing (the live feed is ahead) |
-     | missing | `ACTIVE`, last HR event at or before `as_of` | `DEACTIVATE` |
-     | invalid (bad phone, cut-off line…) | any | nothing; **the employee counts as present** |
-  3. The plan is stored in `reconciliation_item`, and bad lines in `reconciliation_error` by line number and code, never values. The temporary files are deleted.
-  4. If the safety brake (below) allows it, the plan is applied one employee at a time through the same [`ApplyService`](src/main/java/com/moveinsync/rostersync/application/ApplyService.java) as live events: same locking, same version rules, same outbox events.
-- **Why this way.**
-  - At most one bucket is in memory, so memory stays flat as files grow; the benchmark below runs on a 256 MB heap.
-  - Hashes make "has anything changed?" a comparison of 32 bytes instead of nine fields.
-  - **A missing employee is deactivated at the stored version, and only if nothing happened since the export.** The live feed keeps running while the file is processed or waits for approval. If the employee was changed after `as_of`, or their version moved since the plan was made, the deactivation is skipped. A stale file never undoes a newer live event.
-  - An invalid row never deactivates its employee. A broken line says nothing about whether the person left.
-- **Proof.**
-  - [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java) covers every row of the table.
-  - [`ReconciliationPlannerIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlannerIT.java): only changes are planned, bad lines are recorded by number and code, an invalid row never deactivates, and the working files are deleted.
-  - [`ReconciliationIT.approvalLaterStillRespectsLiveChangesMadeInBetween`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationIT.java).
-  - [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java): 200,000 employees, see [Performance and cost](#performance-and-cost).
+The file format:
+```
+#HEADER,tenant=acme,as_of=2026-10-30T02:00:00Z
+employee_id,version,first_name,last_name,email,phone,manager_id,office_code,shift_code,status
+E000001,12,Asha,Rao,asha@acme.example,+919876543210,E000002,BLR-01,DAY,ACTIVE
+#TRAILER,count=200000
+```
+```bash
+curl -s -X POST localhost:8080/api/v1/reconciliations -H "Authorization: Bearer $HR" -F file=@export.csv
+# 202 {"runId":"9b2e…","status":"RUNNING"}, Location: /api/v1/reconciliations/9b2e…
+curl -s localhost:8080/api/v1/reconciliations/$RUN -H "Authorization: Bearer $OPS"
+curl -s "localhost:8080/api/v1/reconciliations/$RUN/errors?page=0" -H "Authorization: Bearer $OPS"
+curl -s -X POST localhost:8080/api/v1/reconciliations/$RUN/approve -H "Authorization: Bearer $OPS"   # or /reject
+```
+- **Upload** (`HR_INTEGRATION` or `OPERATOR`), multipart part `file`, up to 100 MB:
+  - `202` with the run id; the work runs in the background, one run at a time.
+  - `400 INVALID_EXPORT_HEADER` (missing or malformed header) and `400 EXPORT_TENANT_MISMATCH` (the header names another client) are returned at once, and no run is created.
+  - `400 INVALID_REQUEST` without a `file` part; `413 UPLOAD_TOO_LARGE`.
+- **Run** (`OPERATOR`):
+  - `status`: `RUNNING`, `PLANNED`, `AWAITING_APPROVAL`, `APPLYING`, `COMPLETED`, `REJECTED` or `FAILED`;
+  - counts: `rowsRead`, `rowsInvalid`, `toCreate`, `toUpdate`, `toDeactivate`, `conflicts`, `activeBefore`, `missingRatio`;
+  - `trailerOk`, `brakeTripped`, `brakeReason`, `applied`, `skipped`, `decidedBy` and timestamps.
+- **Errors** (`OPERATOR`): 100 bad lines per page, `{"lineNo":13,"employeeId":"E11","code":"UNKNOWN_OFFICE"}`. A line with the wrong number of columns has no `employeeId`.
+- **Approve** → `202`, applied in the background. **Reject** → `200`, nothing applied. Both: `409 RUN_NOT_AWAITING_APPROVAL` if the run isn't held; `404` for another client's run.
+- A test file of any size: `scripts/generate-export.sh --rows 200000 [--truncate-at 120000] --out data/generated/x.csv` (needs JDK 21).
+- Tested in [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java).
 
-### The safety brake
+### `POST /dev/token` (demo and dev profiles only)
 
-- **The rule.** If tonight's file would deactivate 30 % or more of a client's active employees, deactivate nobody, alert an operator, and wait for a human.
-- **Without it.** The case study's example: a file that stops at row 120,000 of 200,000 would mark 80,000 people as having left and cancel their cabs.
-- **How.** [`SafetyBrake`](src/main/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrake.java) looks at the finished plan, before anything is applied:
-  - `FILE_TRUNCATED`: the trailer is missing or its count is wrong. This trips even when nobody would be deactivated, because the file cannot be trusted.
-  - `MISSING_RATIO_EXCEEDED`: planned deactivations ÷ active employees ≥ `rostersync.reconciliation.brake-threshold` (default `0.30`), computed with `BigDecimal`.
-  - When it trips, the **whole** plan waits, creates and updates included: the run goes to `AWAITING_APPROVAL`. The counter `reconciliation.brake.tripped{tenant,reason}` goes up and a WARN line with the run id is logged.
-  - An operator reviews the counts with `GET /api/v1/reconciliations/{id}`, then calls `approve` (the plan is applied, still skipping anyone changed in the meantime) or `reject` (nothing is applied).
-  - Deciding twice, or deciding a run that is not waiting, is `409 RUN_NOT_AWAITING_APPROVAL`, so a double click cannot apply a plan twice.
-- **Why hold the whole plan?** A file cut short is suspect in every row, not only in the missing ones. Applying half a plan would also leave a state that matches neither the file nor yesterday.
-- **Proof.**
-  - [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java): thresholds, boundaries, zero active employees.
-  - [`ReconciliationIT.brakeStopsRun`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationIT.java) and `fileWithoutTrailerTripsEvenWhenNobodyIsMissing`.
-  - [`BrakeThresholdConfigIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/BrakeThresholdConfigIT.java): the threshold comes from configuration.
-  - [`ExampleUseCaseIT.truncatedFileAt120kDeactivatesNobody`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java): 200,000 employees and a file cut at row 120,000, mid-row. The run waits with `FILE_TRUNCATED` and 79,999 planned deactivations; the half row counts as present. Nobody is deactivated and no event is written, including after an operator rejects the run.
-  - [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java): approve, reject, deciding twice, roles.
+```bash
+curl -s -X POST localhost:8080/dev/token -H 'Content-Type: application/json' \
+  -d '{"tenantId":"acme","subject":"workday","roles":["HR_INTEGRATION"]}'
+# {"token":"eyJ…","expiresAt":"…"}
+```
+Without the demo or dev profile this route doesn't exist (`404`). Tested in [`DevTokenIT`](src/test/java/com/moveinsync/rostersync/api/security/DevTokenIT.java) and [`DevTokenAbsentIT`](src/test/java/com/moveinsync/rostersync/api/security/DevTokenAbsentIT.java).
 
-## Design decisions
+### `GET /actuator/health` and `GET /actuator/prometheus`
 
-| # | Decision | Why | Alternative considered | What we gave up |
-|---|---|---|---|---|
-| D1 | Java 21 + Spring Boot 4, Maven wrapper | Records, sealed types and pattern matching for the domain; the standard Java service stack | Go, Kotlin, Gradle | More boilerplate and memory than Go |
-| D2 | PostgreSQL as the single source of truth | The change and its event in one ACID transaction; row locks, `SKIP LOCKED`, JSONB | MongoDB, MySQL | One primary: a write ceiling and a failover concern |
-| D3 | Kafka protocol, served by Redpanda | Ordered per key, replayable; one light container for the demo | RabbitMQ, direct HTTP to bookings | Redpanda locally vs Kafka in production (same client, no code change) |
-| D4 | Events carry the full HR state | Ignoring an older event loses nothing | Deltas with per-field versions | Bigger payloads; HR must send whole records |
-| D5 | Per-employee version from HR; apply / duplicate / conflict / stale | One comparison gives order and idempotency | Timestamps, arrival order, a dedupe table per event | Relies on HR's versions being correct |
-| D6 | Idempotency key `(tenant, source system, employee, version)` | The natural key HR already sends; unique index in the event log | `Idempotency-Key` header per request | Two HR systems for one employee are not supported |
-| D7 | Field ownership by separate write paths and versions | HR's SQL cannot touch transport columns | `if` checks in code, one version per row | Two version columns, two endpoints |
-| D8 | One transaction per record on ingest | One bad record can't undo the batch | One transaction per batch, async inbox | Latency per batch |
-| D9 | Nightly diff in 64 hash buckets, two passes | Memory O(n / 64) | Two in-memory maps, sort-merge, SQL diff in a staging table | Temporary disk, two passes |
-| D10 | Plan first, then apply | The brake judges a complete plan; nothing to undo | Apply while reading, roll back on trip | The plan is stored; a delay before apply |
-| D11 | Apply the plan through the live apply path | A file taken at 02:00 can't overwrite a live change from 02:05 | A separate bulk write path | Slower than a bulk update |
-| D12 | Transactional outbox + one ordered relay | Change and event never disagree; per-employee order | Dual write, Debezium (CDC), Kafka transactions | ≤ 200 ms latency; one relay is the ceiling |
-| D13 | Booking side effects in an idempotent consumer | Separate concern; dedupe by event id in the same transaction | Cancel inside the apply transaction | Cancellations are ~1 s later (eventual) |
-| D14 | JWT with roles; tenant only from the token; 404 across tenants | Stateless; no tenant spoofing; existence isn't leaked | Sessions, API keys, tenant in the URL | HS256 demo key; production uses RS256 from an identity provider |
-| D15 | `tenant_id` in every key and every repository method | Impossible to write a query that forgets the tenant | Postgres row-level security | Verbose signatures |
-| D16 | In-process Caffeine caches, read paths only | Fewer repeated reads, bounded staleness | Redis, no cache | Per-instance staleness (≤ 30 s / 5 min) |
-| D17 | RFC 7807 problem details with stable codes | Clients branch on `code`; no personal data | Ad-hoc error bodies | — |
-| D18 | Micrometer → Prometheus → Grafana; JSON logs with trace id | Standard, alertable, searchable | OpenTelemetry collector | Two more containers |
-| D19 | Strong consistency for the roster, eventual downstream | A wrong roster is worse than a short refusal | Accept writes without the database | Ingest is down while the database is |
-| D20 | Layered design with a framework-free domain, enforced by a test | Rules tested in milliseconds; can't drift into frameworks | Controller–service–repository with JPA entities as the model | Mapping code between layers |
+- Health returns only `UP` or `DOWN` (plus `/liveness` and `/readiness`); the second returns the metrics.
+- No other actuator endpoint is exposed.
+- Tested in [`MetricsIT`](src/test/java/com/moveinsync/rostersync/MetricsIT.java).
 
-**The three that matter most.**
-- **The version rule (D4 + D5).** Ordering, duplicates and retries are all handled by one comparison on full-state events, inside a row lock. There is no clock to trust and no separate dedupe store on the hot path. The cost is a dependency on HR's versions being right, so a reset at HR would show up as a spike in `STALE` and needs an operational fix.
-- **The outbox (D12).** It's the only way to make "save" and "tell the others" atomic without a distributed transaction. The relay keeps per-employee order even after the [load-test-driven change](#performance-and-cost) that pipelines sends: one employee never has two events in flight.
-- **Plan, then brake (D9 + D10 + D11).** Nothing from the nightly file is applied until the whole file is known to be complete and plausible. Even then, every change goes through the same version rule as live updates, so an old file can never undo a newer live change.
+### Change events (topic `rostersync.employee-changes`)
+
+Key: `tenant:employee`. Headers: `eventId`, `eventType`. Value:
+```json
+{ "eventId": "41dd…", "tenantId": "acme", "employeeId": "E000042", "type": "EMPLOYEE_DEACTIVATED",
+  "status": "INACTIVE", "hrVersion": 12, "transportVersion": 3, "changedFields": ["status"],
+  "occurredAt": "2026-10-30T09:00:00Z" }
+```
+- `type` is one of `EMPLOYEE_CREATED`, `EMPLOYEE_UPDATED`, `EMPLOYEE_DEACTIVATED`, `EMPLOYEE_REACTIVATED` or `TRANSPORT_UPDATED`.
+- Delivery is at least once, so consumers must ignore an `eventId` they have already handled.
+
+### Errors
+
+Every error is an [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) problem document with a stable `code` and the request's `traceId`. The same id is returned in the `X-Trace-Id` header and appears on every log line of that request.
+
+```json
+{ "type": "urn:rostersync:error:invalid-request", "title": "Bad Request", "status": 400,
+  "code": "INVALID_REQUEST", "fields": ["events"], "traceId": "6f1c…" }
+```
+
+## Testing: how to run every test
+
+### What you need
+
+| To run | You need |
+|---|---|
+| Unit tests | JDK 21 ([Temurin](https://adoptium.net/temurin/releases/?version=21)); no Docker needed |
+| Integration tests, the benchmark | JDK 21 and Docker running. Each test run starts its own PostgreSQL and Kafka-compatible broker in Docker (Testcontainers), separate from the `docker compose` stack |
+| Alert-rule tests | Docker |
+| Load test, guided tour | The running stack (`docker compose up -d --build --wait`) |
+
+The project includes the Maven wrapper (`./mvnw`), so Maven itself doesn't need installing. On Windows use `mvnw.cmd`.
+
+### The commands
+
+| What | Command | Time |
+|---|---|---|
+| All unit tests (177) | `./mvnw test` | ~10 s |
+| Everything: unit + integration (158) | `./mvnw verify` | ~2 min |
+| One unit test class | `./mvnw test -Dtest=VersionPolicyTest` | |
+| One unit test method | `./mvnw test -Dtest='VersionPolicyTest#transferV7BeforeShiftV6EndsInNewOfficeWithV7Shift'` | |
+| One integration test class | `./mvnw verify -Dit.test=TenantIsolationIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` | |
+| One integration test method | `./mvnw verify -Dit.test='ExampleUseCaseIT#transferV7BeforeShiftV6' -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` | |
+| The 200,000-row benchmark, 256 MB heap | `./mvnw verify -Pbenchmark` → `target/benchmark/reconciliation.txt` | ~1 min |
+| Alert rules (`promtool`) | `scripts/check-alerts.sh` | seconds |
+| Load test (k6, against the running stack) | `scripts/loadtest.sh` (`VUS=40 DURATION=2m scripts/loadtest.sh` to change it) | 1 min |
+| Every route, end to end | `scripts/demo-tour.sh` (against the running stack) | 30 s |
+
+Results: `target/surefire-reports` (unit), `target/failsafe-reports` (integration), and the console summary (`Tests run: …, Failures: 0`).
+
+### Every test class
+
+| Problem | Test class | Kind | Tests | What it proves | Run it |
+|---|---|---|---|---|---|
+| 1. Bad data | [`CompositeValidatorTest`](src/test/java/com/moveinsync/rostersync/domain/validation/CompositeValidatorTest.java) | Unit | 19 | Required fields, email, E.164 phone, office; errors never contain the values | `./mvnw test -Dtest=CompositeValidatorTest` |
+|  | [`IngestControllerIT`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java) | IT | 13 | The batch endpoint: per-record results, one bad record never fails the batch, no personal data in reports | `./mvnw verify -Dit.test=IngestControllerIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`HrEventTest`](src/test/java/com/moveinsync/rostersync/domain/HrEventTest.java) | Unit | 5 | The three event types and their rules | `./mvnw test -Dtest=HrEventTest` |
+| 2–3. Duplicates, order, concurrency | [`VersionPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/VersionPolicyTest.java) | Unit | 6 | The apply / duplicate / conflict / stale table, incl. v7-before-v6 | `./mvnw test -Dtest=VersionPolicyTest` |
+|  | [`PayloadHasherTest`](src/test/java/com/moveinsync/rostersync/domain/PayloadHasherTest.java) | Unit | 10 | The content fingerprint is stable and changes when any HR field changes | `./mvnw test -Dtest=PayloadHasherTest` |
+|  | [`EmployeeTest`](src/test/java/com/moveinsync/rostersync/domain/EmployeeTest.java) | Unit | 14 | The employee: create, apply HR, apply transport, deactivate | `./mvnw test -Dtest=EmployeeTest` |
+|  | [`ApplyServiceIT`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java) | IT | 13 | Every outcome against the database, incl. exits arriving first | `./mvnw verify -Dit.test=ApplyServiceIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ExampleUseCaseIT`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java) | IT | 2 | The case study's two examples: v7 before v6; a file cut at 120,000 of 200,000 | `./mvnw verify -Dit.test=ExampleUseCaseIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ReplayFeedTwiceIT`](src/test/java/com/moveinsync/rostersync/ReplayFeedTwiceIT.java) | IT | 1 | A 1,000-event feed sent twice changes nothing | `./mvnw verify -Dit.test=ReplayFeedTwiceIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java) | IT (concurrency) | 1 | 32 threads, shuffled versions 1–200 for one employee: no lost or double update | `./mvnw verify -Dit.test=ConcurrentApplyIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+| 4. Field ownership | [`FieldOwnershipPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/FieldOwnershipPolicyTest.java) | Unit | 11 | Which owner each field has; foreign and unknown fields | `./mvnw test -Dtest=FieldOwnershipPolicyTest` |
+|  | [`HrOwnedFieldsTest`](src/test/java/com/moveinsync/rostersync/domain/HrOwnedFieldsTest.java) | Unit | 5 | HR fields: ownership check, change detection, safe printing | `./mvnw test -Dtest=HrOwnedFieldsTest` |
+|  | [`TransportPatchIT`](src/test/java/com/moveinsync/rostersync/api/employee/TransportPatchIT.java) | IT | 11 | Admin edits: If-Match, 412, 428, FIELD_NOT_OWNED, HR updates keep transport fields | `./mvnw verify -Dit.test=TransportPatchIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`EmployeeRepositoryIT`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/EmployeeRepositoryIT.java) | IT | 13 | The database layer: HR writes never touch transport columns; version conditions; client scoping | `./mvnw verify -Dit.test=EmployeeRepositoryIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+| 5–6. Nightly file and safety brake | [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java) | Unit | 13 | Every row of the comparison table | `./mvnw test -Dtest=ReconciliationDifferTest` |
+|  | [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java) | Unit | 8 | Thresholds, the exact 30 % boundary, a missing trailer | `./mvnw test -Dtest=SafetyBrakeTest` |
+|  | [`BucketAssignerTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/BucketAssignerTest.java) | Unit | 6 | Bucket numbers are stable and spread evenly | `./mvnw test -Dtest=BucketAssignerTest` |
+|  | [`ExportReaderTest`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ExportReaderTest.java) | Unit | 9 | Reading the file: header, trailer, line numbers, cut-off lines | `./mvnw test -Dtest=ExportReaderTest` |
+|  | [`ExportGeneratorTest`](src/test/java/com/moveinsync/rostersync/tools/ExportGeneratorTest.java) | Unit | 4 | The test-file generator writes valid, cut-off and changed files | `./mvnw test -Dtest=ExportGeneratorTest` |
+|  | [`ReconciliationPlannerIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationPlannerIT.java) | IT | 5 | Planning: only changes, bad lines by number and code, invalid = present, temp files deleted | `./mvnw verify -Dit.test=ReconciliationPlannerIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ReconciliationIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationIT.java) | IT | 5 | Normal night, brake, missing trailer, late approval, unreadable file | `./mvnw verify -Dit.test=ReconciliationIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`BrakeThresholdConfigIT`](src/test/java/com/moveinsync/rostersync/application/reconciliation/BrakeThresholdConfigIT.java) | IT | 2 | The threshold comes from configuration | `./mvnw verify -Dit.test=BrakeThresholdConfigIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java) | IT | 10 | Upload, read, errors, approve, reject, roles over HTTP | `./mvnw verify -Dit.test=ReconciliationApiIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java) | Benchmark | 1 | 200,000 rows in under 60 s on a 256 MB heap (`-Pbenchmark` only) | `./mvnw verify -Pbenchmark` |
+| 7–8. Change events and bookings | [`OutboxIT`](src/test/java/com/moveinsync/rostersync/OutboxIT.java) | IT | 8 | The event is saved in the same transaction; none for duplicates, stale or rejected records | `./mvnw verify -Dit.test=OutboxIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`OutboxRelayIT`](src/test/java/com/moveinsync/rostersync/application/OutboxRelayIT.java) | IT | 6 | Order per employee, stop at the first failure, one active relay, pipelined sends | `./mvnw verify -Dit.test=OutboxRelayIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`OutboxRelaySchedulerTest`](src/test/java/com/moveinsync/rostersync/application/OutboxRelaySchedulerTest.java) | Unit | 3 | The relay's timing and backoff | `./mvnw test -Dtest=OutboxRelaySchedulerTest` |
+|  | [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java) | IT (failure injection) | 2 | Crash between the database write and the publish, both points | `./mvnw verify -Dit.test=OutboxCrashRecoveryIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java) | IT (failure injection) | 1 | Broker outage: ingest continues, the backlog drains in order | `./mvnw verify -Dit.test=BrokerDownIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java) | IT | 5 | Exit → future bookings cancelled, seats freed, duplicates and late copies ignored | `./mvnw verify -Dit.test=DeactivationConsumerIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`BookingApiIT`](src/test/java/com/moveinsync/rostersync/api/booking/BookingApiIT.java) | IT | 6 | Booking rules, and an exit cancelling a booking end to end | `./mvnw verify -Dit.test=BookingApiIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+| 9. Personal data and errors | [`NoPiiInLogsIT`](src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java) | IT | 1 | No personal value in any log line, metric or error body, across every flow | `./mvnw verify -Dit.test=NoPiiInLogsIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`GlobalExceptionHandlerTest`](src/test/java/com/moveinsync/rostersync/api/GlobalExceptionHandlerTest.java) | Unit | 7 | Every error is a problem document with a code; no exception message leaks | `./mvnw test -Dtest=GlobalExceptionHandlerTest` |
+|  | [`TraceIdFilterTest`](src/test/java/com/moveinsync/rostersync/api/TraceIdFilterTest.java) | Unit | 4 | Every request gets a trace id | `./mvnw test -Dtest=TraceIdFilterTest` |
+|  | [`StructuredLoggingIT`](src/test/java/com/moveinsync/rostersync/StructuredLoggingIT.java) | IT | 1 | Logs are JSON with trace, client and employee ids | `./mvnw verify -Dit.test=StructuredLoggingIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+| 10. Security and client isolation | [`SecurityIT`](src/test/java/com/moveinsync/rostersync/api/security/SecurityIT.java) | IT | 9 | 401 and 403 cases, deny by default | `./mvnw verify -Dit.test=SecurityIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java) | IT | 6 | Another client's data is a 404, identical to a missing id | `./mvnw verify -Dit.test=TenantIsolationIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`EmployeeReadIT`](src/test/java/com/moveinsync/rostersync/api/employee/EmployeeReadIT.java) | IT | 7 | Admin and employee reads, ETag, roles | `./mvnw verify -Dit.test=EmployeeReadIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`DevTokenIT`](src/test/java/com/moveinsync/rostersync/api/security/DevTokenIT.java) | IT | 4 | Demo tokens work under the dev profile | `./mvnw verify -Dit.test=DevTokenIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`DevTokenAbsentIT`](src/test/java/com/moveinsync/rostersync/api/security/DevTokenAbsentIT.java) | IT | 1 | …and don't exist without it | `./mvnw verify -Dit.test=DevTokenAbsentIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`SchemaIT`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/SchemaIT.java) | IT | 8 | The database itself refuses bad rows, duplicates and cross-client links | `./mvnw verify -Dit.test=SchemaIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+| 11–12. Monitoring, caching, running | [`MetricsIT`](src/test/java/com/moveinsync/rostersync/MetricsIT.java) | IT | 3 | Every on-call metric is exposed after real traffic; other endpoints closed | `./mvnw verify -Dit.test=MetricsIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`OfficeCacheTest`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/OfficeCacheTest.java) | Unit | 5 | The office cache, with a fake clock | `./mvnw test -Dtest=OfficeCacheTest` |
+|  | [`EmployeeReadCacheTest`](src/test/java/com/moveinsync/rostersync/application/EmployeeReadCacheTest.java) | Unit | 5 | The employee read cache, with a fake clock | `./mvnw test -Dtest=EmployeeReadCacheTest` |
+|  | [`EmployeeReadCacheIT`](src/test/java/com/moveinsync/rostersync/api/employee/EmployeeReadCacheIT.java) | IT | 4 | Cache behaviour over HTTP; a stale ETag gets 412 | `./mvnw verify -Dit.test=EmployeeReadCacheIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`OfficeDirectoryIT`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/OfficeDirectoryIT.java) | IT | 5 | Office lookup per client; inactive offices are unknown | `./mvnw verify -Dit.test=OfficeDirectoryIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`DemoProfileIT`](src/test/java/com/moveinsync/rostersync/DemoProfileIT.java) | IT | 2 | The demo profile's data and tokens | `./mvnw verify -Dit.test=DemoProfileIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ApplicationContextIT`](src/test/java/com/moveinsync/rostersync/ApplicationContextIT.java) | IT | 2 | The application starts against real PostgreSQL and Kafka | `./mvnw verify -Dit.test=ApplicationContextIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false` |
+|  | [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java) | Unit | 3 | The layers stay as designed; the rules have no framework imports | `./mvnw test -Dtest=ArchitectureTest` |
+
+Every case-study requirement maps to its tests in the [traceability matrix](docs/traceability.md).
+
+- **Unit** tests check the rules in plain Java, in milliseconds.
+- **IT** (integration) tests run the whole application against real PostgreSQL and Kafka.
+- **Failure injection** tests crash or disconnect things on purpose.
+- The tests for the key guarantees were checked to fail when the guarded code is broken: removing the consumer's event-id check, removing the row lock, changing an alert threshold, and reintroducing the data leak the personal-data test found.
 
 ## Trade-offs: consistency vs availability vs latency
 
@@ -542,7 +996,7 @@ More detail, with diagrams: [docs/design-note.md](docs/design-note.md).
 
 ## Monitoring — what on-call sees at 3 AM
 
-`docker compose up --build --wait` (see [Run it](#run-it)) starts, next to the app:
+`docker compose up --build --wait` (see [Run it](#run-it-in-5-minutes)) starts, next to the app:
 - **Prometheus** on [localhost:9090](http://localhost:9090), scraping the app's `/actuator/prometheus` every 15 s;
 - **Grafana** on [localhost:3000](http://localhost:3000), with the provisioned dashboard **HR Roster Sync** (anonymous view; `admin`/`admin` for local editing).
 
@@ -715,270 +1169,19 @@ Nightly reconciliation ([`V4__reconciliation.sql`](src/main/resources/db/migrati
 | `reconciliation_item` | The plan: one row per create, update or deactivation, with the version it was planned at. Creates and updates carry the HR fields to apply (JSONB) until the run is decided. |
 | `reconciliation_error` | One row per bad line: line number, employee id when readable, error code. Never the line's values. |
 
-## API reference
+## Technology choices
 
-All endpoints are under `/api/v1`, take and return JSON, and need a bearer token. The client (tenant) is taken from the token's `tenant_id` claim, never from the URL or body.
-
-| Method and path | Role | Purpose |
+| Choice | Why | Alternative considered |
 |---|---|---|
-| `POST /api/v1/hr/events:batch` | `HR_INTEGRATION` | Up to 1,000 HR events, a result per record |
-| `GET /api/v1/employees/{id}` | `ADMIN` | One employee; `ETag` = transport version |
-| `GET /api/v1/employees/me` | `EMPLOYEE` | Own record (id from the token) |
-| `PATCH /api/v1/employees/{id}/transport` | `ADMIN` | Pickup point and special assistance; `If-Match` required |
-| `POST /api/v1/bookings`, `GET /api/v1/bookings?employeeId=` | `ADMIN` | Book a seat; list bookings |
-| `POST /api/v1/reconciliations` | `HR_INTEGRATION`, `OPERATOR` | Upload a nightly file → `202 {runId}` |
-| `GET /api/v1/reconciliations/{id}`, `…/errors` | `OPERATOR` | A run and its bad lines |
-| `POST /api/v1/reconciliations/{id}/approve`, `…/reject` | `OPERATOR` | Decide a held run |
-| `POST /dev/token` | none (demo/dev profiles only) | A token for any demo identity |
-| `GET /actuator/health`, `GET /actuator/prometheus` | none | Health; metrics |
-
-Every request with real output: [docs/curl-examples.md](docs/curl-examples.md). Postman: [docs/postman_collection.json](docs/postman_collection.json) (run its "0. Tokens" folder first).
-
-### `POST /api/v1/hr/events:batch`
-
-Up to 1,000 HR events; each is handled on its own.
-
-```json
-{
-  "sourceSystem": "workday",
-  "events": [
-    { "type": "UPDATE", "employeeId": "E000042", "version": 7, "occurredAt": "2026-10-30T08:00:07Z",
-      "firstName": "…", "lastName": "…", "email": "…", "phone": "+919876543210",
-      "managerId": "E000001", "officeCode": "HYD-02", "shiftCode": "NIGHT" },
-    { "type": "DEACTIVATE", "employeeId": "E000043", "version": 12, "occurredAt": "2026-10-30T09:00:00Z" }
-  ]
-}
-```
-
-- `type` is `CREATE`, `UPDATE` or `DEACTIVATE`.
-- A `DEACTIVATE` may send only the header, as above, or the full record (recommended): with the full record, an exit that arrives before any other event for that employee is still recorded.
-
-Response `200`:
-```json
-{ "results": [
-  { "index": 0, "employeeId": "E000042", "outcome": "APPLIED" },
-  { "index": 1, "employeeId": "E000043", "outcome": "REJECTED", "errorCode": "UNKNOWN_EMPLOYEE" }
-] }
-```
-
-`outcome` is `APPLIED`, `DUPLICATE`, `STALE` or `REJECTED`. Rejection codes:
-- `MALFORMED_RECORD`
-- `INVALID_EVENT_TYPE`
-- `MISSING_REQUIRED_FIELD`
-- `INVALID_VERSION`
-- `INVALID_EMAIL`
-- `INVALID_PHONE`
-- `UNKNOWN_OFFICE`
-- `UNKNOWN_EMPLOYEE`
-- `VERSION_CONFLICT`
-
-### `GET /api/v1/employees/{id}` (ADMIN) and `GET /api/v1/employees/me` (EMPLOYEE)
-
-These return the employee record. The `ETag` header carries the transport version (`"0"`, `"1"`, …), which a transport edit must send back. An id that is not in the caller's tenant answers `404`.
-
-### `PATCH /api/v1/employees/{id}/transport` (ADMIN)
-
-```http
-PATCH /api/v1/employees/E000042/transport
-If-Match: "0"
-Content-Type: application/json
-
-{ "pickupPoint": "Gate 2, Tech Park" }
-```
-
-- `200` with the updated record and `ETag: "1"`.
-- A field left out keeps its value; a field sent as `null` is cleared.
-- `428 PRECONDITION_REQUIRED` without `If-Match`, and `412 TRANSPORT_VERSION_MISMATCH` if someone else edited first. Nothing changes in either case.
-- `400 FIELD_NOT_OWNED` if the body names an HR-owned field (such as `officeCode`), and `400 INVALID_REQUEST` for an unknown field. Both list the field names.
-
-### `POST /api/v1/bookings` and `GET /api/v1/bookings?employeeId=` (ADMIN)
-
-These are minimal, there to show what an exit does to bookings.
-- `POST {"tripId":"T1","employeeId":"E000042"}` → `201` with the booking.
-- `409` when the trip is full (`TRIP_FULL`), already departed (`TRIP_DEPARTED`), the employee is inactive (`EMPLOYEE_INACTIVE`), or the employee already holds a seat on it (`ALREADY_BOOKED`).
-- `404` for an unknown trip or employee, or one in another tenant.
-- `GET` lists the employee's bookings with status and cancel reason.
-
-### Change events (topic `rostersync.employee-changes`)
-
-Key: `tenant:employee`. Headers: `eventId`, `eventType`. Value:
-```json
-{ "eventId": "41dd…", "tenantId": "acme", "employeeId": "E000042", "type": "EMPLOYEE_DEACTIVATED",
-  "status": "INACTIVE", "hrVersion": 12, "transportVersion": 3, "changedFields": ["status"],
-  "occurredAt": "2026-10-30T09:00:00Z" }
-```
-- `type` is one of `EMPLOYEE_CREATED`, `EMPLOYEE_UPDATED`, `EMPLOYEE_DEACTIVATED`, `EMPLOYEE_REACTIVATED` or `TRANSPORT_UPDATED`.
-- Delivery is at least once, so consumers must ignore an `eventId` they have already handled.
-
-### Nightly reconciliation
-
-`POST /api/v1/reconciliations` (`HR_INTEGRATION` or `OPERATOR`), multipart with the export as part `file`, up to 100 MB:
-```bash
-curl -s -X POST localhost:8080/api/v1/reconciliations -H "Authorization: Bearer $TOKEN" \
-  -F file=@data/generated/full-200k.csv
-# 202 {"runId":"9b2e…","status":"RUNNING"}, Location: /api/v1/reconciliations/9b2e…
-```
-- The header is checked straight away: `400 INVALID_EXPORT_HEADER` for a missing or malformed one, and `400 EXPORT_TENANT_MISMATCH` when it names another client. In both cases no run is created.
-- Everything else happens in the background, one run at a time.
-
-`GET /api/v1/reconciliations/{id}` (`OPERATOR`) returns the run: status, counts (`rowsRead`, `rowsInvalid`, `toCreate`, `toUpdate`, `toDeactivate`, `conflicts`, `activeBefore`, `missingRatio`), `trailerOk`, `brakeTripped`, `brakeReason`, `applied`, `skipped`, `decidedBy` and timestamps.
-
-`GET /api/v1/reconciliations/{id}/errors?page=0` (`OPERATOR`) lists 100 bad lines per page: `{"lineNo":13,"employeeId":"E11","code":"UNKNOWN_OFFICE"}`.
-
-`POST /api/v1/reconciliations/{id}/approve` → `202`, the plan is applied in the background. `POST …/reject` → `200`, nothing is applied. Both are `OPERATOR` only. A run that is not `AWAITING_APPROVAL` gives `409 RUN_NOT_AWAITING_APPROVAL`; another client's run gives `404`.
-
-A test export of any size: `scripts/generate-export.sh --rows 200000 [--truncate-at 120000] --out data/generated/x.csv`.
-
-### `POST /dev/token` (only under the `dev` / `demo` profiles)
-
-```bash
-curl -s -X POST localhost:8080/dev/token -H 'Content-Type: application/json' \
-  -d '{"tenantId":"acme","subject":"workday","roles":["HR_INTEGRATION"]}'
-# {"token":"eyJ…","expiresAt":"…"}
-```
-
-### Errors
-
-Every error is an [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) problem document with a stable `code` and the request's `traceId`. The same id is returned in the `X-Trace-Id` header and appears on every log line of that request.
-
-```json
-{ "type": "urn:rostersync:error:invalid-request", "title": "Bad Request", "status": 400,
-  "code": "INVALID_REQUEST", "fields": ["events"], "traceId": "6f1c…" }
-```
-
-## Run it
-
-### One command (Docker only)
-
-```bash
-docker compose up --build --wait
-```
-
-This builds the app image and starts five services. `--wait` returns once all of them report healthy, about 3 minutes on the first build and seconds afterwards.
-
-| Service | Address | What it is |
-|---|---|---|
-| `app` | http://localhost:8080 | The API, built from the [`Dockerfile`](Dockerfile), under the **`demo` profile** |
-| `postgres` | localhost:5432 | PostgreSQL 16 (database, user and password `rostersync`) |
-| `redpanda` | localhost:19092 | Kafka-compatible broker |
-| `prometheus` | http://localhost:9090 | Metrics and alert rules |
-| `grafana` | http://localhost:3000 | Dashboard "HR Roster Sync" (view anonymously; `admin`/`admin` to edit) |
-
-> **The `demo` profile is for local evaluation only, and it is off unless you ask for it.** It turns on `POST /dev/token`, which hands out a token for any tenant and role, and it loads demo data. Its signing key comes from `ROSTERSYNC_SECURITY_JWT_SECRET`, which defaults to a demo key in `docker-compose.yml`. A real deployment runs without `demo` or `dev`, provides its own key, and gets tokens from its identity provider.
-
-**Demo data** ([`R__demo_seed.sql`](src/main/resources/db/demo/R__demo_seed.sql)):
-- tenants `acme` (offices `BLR-01`, `HYD-02`, and `PUN-03`, which is inactive) and `globex` (`BLR-01`, `CHN-01`);
-- trips `T-ACME-1`, `T-ACME-2` and `T-GLOBEX-1` tomorrow, plus `T-ACME-OLD`, which already ran.
-Employees come in through the API, as in real life.
-
-**Demo users** are token identities; ask `/dev/token` for any of them:
-
-| Tenant | Subject | Role | Use |
-|---|---|---|---|
-| `acme` | `workday` | `HR_INTEGRATION` | send HR events, upload a nightly file |
-| `acme` | `admin-1` | `ADMIN` | read employees, edit transport fields, book trips |
-| `acme` | `ops-1` | `OPERATOR` | review, approve or reject nightly runs |
-| `acme` | `E000042` | `EMPLOYEE` | `GET /api/v1/employees/me` once E000042 exists |
-| `globex` | `workday` | `HR_INTEGRATION` | the second tenant, to see isolation |
-
-```bash
-TOKEN=$(curl -s -X POST localhost:8080/dev/token -H 'Content-Type: application/json' \
-  -d '{"tenantId":"acme","subject":"workday","roles":["HR_INTEGRATION"]}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-curl -s -X POST localhost:8080/api/v1/hr/events:batch -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"sourceSystem":"workday","events":[{"type":"CREATE","employeeId":"E000042","version":1,"occurredAt":"2026-10-30T08:00:00Z",
-       "firstName":"Asha","email":"asha@acme.example","phone":"+919876543210","officeCode":"BLR-01","shiftCode":"DAY"}]}'
-# {"results":[{"index":0,"employeeId":"E000042","outcome":"APPLIED"}]}
-```
-
-### A 5-minute guided tour
-
-```bash
-scripts/demo-tour.sh
-```
-On a fresh stack, it runs every rule through the real API in order:
-- a joiner, a duplicate, and v3-before-v2;
-- a batch with bad records;
-- field ownership with `If-Match`;
-- the cross-tenant 404;
-- a booking cancelled by an exit;
-- a normal night;
-- a **truncated night** that the brake holds and the operator rejects;
-- a night that drops half the staff, held and then approved.
-
-Each step's command and its real output are in [docs/curl-examples.md](docs/curl-examples.md).
-
-Stop it with `docker compose down`, which keeps the data; `docker compose down -v` also deletes the volumes.
-
-### Developing (JDK 21 + Docker)
-
-Maven is not required; the project ships with the Maven wrapper.
-
-```bash
-docker compose up -d postgres redpanda                 # only the database and broker
-./mvnw spring-boot:run -Dspring-boot.run.profiles=dev  # the API on localhost:8080, with a local-only signing key
-./mvnw test                                            # unit tests, no Docker needed
-./mvnw verify                                          # unit + integration tests; each test context starts its own Postgres and Redpanda
-./mvnw verify -Pbenchmark                              # only the 200,000-employee reconciliation benchmark, 256 MB heap
-scripts/generate-export.sh --rows 200000               # a synthetic nightly export in data/generated/
-scripts/check-alerts.sh                                # validate the Prometheus config and unit-test the alert rules (Docker)
-scripts/loadtest.sh                                    # k6 ingest load test against the compose app (Docker)
-```
-
-- The application refuses to start without a token signing key (`rostersync.security.jwt-secret`, at least 32 bytes). The `dev` profile supplies a local-only one.
-- Prometheus scrapes the `app` container. To watch an app started with `spring-boot:run` instead, stop the container (`docker compose stop app`) and change the target in [`prometheus.yml`](ops/prometheus/prometheus.yml) to `host.docker.internal:8080`.
-- Integration tests never use the compose services: they start their own containers through Testcontainers, so Docker must be running for `./mvnw verify`. At most three test contexts (and their containers) are alive at a time ([`spring.properties`](src/test/resources/spring.properties)), so a full run fits in 6 GB of Docker memory next to the running stack.
-
-## Project structure
-
-```
-src/main/java/com/moveinsync/rostersync/
-├── api/                 HTTP: controllers, request/response shapes, errors (ProblemDetail), trace ids
-│   ├── ingest/          POST /hr/events:batch, one result per record
-│   ├── employee/        GET employee, GET /me, PATCH transport fields with If-Match
-│   ├── booking/         minimal bookings, to show what an exit does
-│   ├── reconciliation/  nightly file upload, runs, approve / reject
-│   └── security/        JWT verification, roles, tenant from the token, /dev/token (dev/demo only)
-├── application/         use cases and transactions: ApplyService, outbox relay, booking consumer, caches
-│   └── reconciliation/  file reader, two-pass planner, applier, run service and runner
-├── domain/              the rules, plain Java: events, Employee, version policy, field ownership, outbox port
-│   ├── validation/      required fields, email, phone (E.164), office code
-│   └── reconciliation/  safety brake, bucket assignment (murmur3), the per-bucket diff
-└── infrastructure/
-    ├── persistence/     JDBC writes per owner, JPA reads, outbox, reconciliation store, office cache, gauges
-    └── messaging/       Kafka publisher and the change-event listener
-src/main/resources/db/   Flyway migrations (migration/), demo seed (demo/, demo profile only)
-src/test/java/…          unit tests next to their packages; *IT integration tests; support/ and tools/
-ops/                     Prometheus config, alert rules and their tests; Grafana provisioning and dashboard
-loadtest/, scripts/      k6 load test; export generator, demo tour, alert checks, load test runner
-docs/                    design note, traceability matrix, curl examples, Postman collection
-```
-
-```mermaid
-flowchart LR
-  api --> application --> domain
-  infrastructure --> domain
-  infrastructure --> application
-```
-`domain` depends on nothing but the JDK and libphonenumber; `application` never depends on `api` or `infrastructure`. [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java) fails the build otherwise.
-
-## Testing strategy
-
-| Kind | What it proves | Examples | Run |
-|---|---|---|---|
-| Unit (177) | Every business rule in isolation, in milliseconds, with no server or database | [`VersionPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/VersionPolicyTest.java), [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java), [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java), [`OfficeCacheTest`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/OfficeCacheTest.java) | `./mvnw test` |
-| Architecture | The layers stay as designed | [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java) | `./mvnw test` |
-| Integration (158) | The full application against real PostgreSQL 16 and a real Kafka-compatible broker (Testcontainers) | [`IngestControllerIT`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java), [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java), [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java) | `./mvnw verify` |
-| Concurrency | No lost or reordered update under contention: 32 threads, shuffled versions 1–200 for one employee | [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java) | `./mvnw verify` |
-| Failure injection | Crashes at both outbox crash points, a broker outage, a failing record mid-batch, a late duplicate after a rehire | [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java), [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java), [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java) | `./mvnw verify` |
-| Data protection | No seeded personal value appears in any log line, metric or error body | [`NoPiiInLogsIT`](src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java) | `./mvnw verify` |
-| Benchmark | 200,000 rows within 60 s on a 256 MB heap | [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java) | `./mvnw verify -Pbenchmark` |
-| Alert rules | Each alert fires and resolves as specified | [`alerts.test.yml`](ops/prometheus/alerts.test.yml) | `scripts/check-alerts.sh` |
-| Load | Throughput and latency under sustained real changes | [`loadtest/ingest.js`](loadtest/ingest.js) | `scripts/loadtest.sh` |
-| End to end | Every rule through the real HTTP API on the one-command stack | [`scripts/demo-tour.sh`](scripts/demo-tour.sh), output in [curl examples](docs/curl-examples.md) | `scripts/demo-tour.sh` |
-
-- One test class: `./mvnw test -Dtest=VersionPolicyTest`. One integration test: `./mvnw verify -Dit.test=TenantIsolationIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`.
-- The tests for the key guarantees were checked to fail when the guarded code is broken: without the consumer's dedupe table, without the row lock, with a changed alert threshold, and with the personal-data leak the PII test found.
-- Every case-study line maps to its proof in the [traceability matrix](docs/traceability.md).
+| Java 21 + Spring Boot 4 | Records, sealed types and pattern matching for the rules; the standard Java service stack | Go, Kotlin |
+| PostgreSQL 16 | One transaction for a change and its event; row locks, `SKIP LOCKED`, JSONB | MongoDB, MySQL |
+| Kafka protocol (Redpanda locally) | Ordered per key and replayable; one light container for the demo, no code change for Apache Kafka | RabbitMQ, direct HTTP calls |
+| Flyway migrations | The schema is versioned code; the ORM only validates it | Generating tables from entities |
+| Layered design with a framework-free core | The rules are tested in milliseconds and can't drift into framework code ([`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java)) | Controller–service–repository with database entities as the model |
+| RFC 7807 problem details | Clients branch on a stable `code`; no personal data | Ad-hoc error bodies |
+| Micrometer → Prometheus → Grafana, JSON logs | Standard, alertable, searchable | An OpenTelemetry collector |
+| Testcontainers | Tests run on the same PostgreSQL and Kafka as production, not imitations | An in-memory database |
+| Docker Compose, multi-stage image (JDK to build, JRE to run, non-root) | One command for a reviewer; a 179 MB image | Installing everything locally |
 
 ## Assumptions
 
@@ -1014,6 +1217,50 @@ flowchart LR
 | A management port for health and metrics | They hold no personal data | `management.server.port` on an internal network |
 | Retention for the event log and outbox | Not needed at demo scale | Partition by month; drop old partitions |
 | A user interface | The case study asks for the backend | — |
+
+## Project structure
+
+```
+src/main/java/com/moveinsync/rostersync/
+├── api/                 HTTP: controllers, request/response shapes, errors (ProblemDetail), trace ids
+│   ├── ingest/          POST /hr/events:batch, one result per record
+│   ├── employee/        GET employee, GET /me, PATCH transport fields with If-Match
+│   ├── booking/         minimal bookings, to show what an exit does
+│   ├── reconciliation/  nightly file upload, runs, approve / reject
+│   └── security/        JWT verification, roles, tenant from the token, /dev/token (dev/demo only)
+├── application/         use cases and transactions: ApplyService, outbox relay, booking consumer, caches
+│   └── reconciliation/  file reader, two-pass planner, applier, run service and runner
+├── domain/              the rules, plain Java: events, Employee, version policy, field ownership, outbox port
+│   ├── validation/      required fields, email, phone (E.164), office code
+│   └── reconciliation/  safety brake, bucket assignment (murmur3), the per-bucket diff
+└── infrastructure/
+    ├── persistence/     JDBC writes per owner, JPA reads, outbox, reconciliation store, office cache, gauges
+    └── messaging/       Kafka publisher and the change-event listener
+src/main/resources/db/   Flyway migrations (migration/), demo seed (demo/, demo profile only)
+src/test/java/…          unit tests next to their packages; *IT integration tests; support/ and tools/
+ops/                     Prometheus config, alert rules and their tests; Grafana provisioning and dashboard
+loadtest/, scripts/      k6 load test; export generator, demo tour, alert checks, load test runner
+docs/                    design note, traceability matrix, curl examples, Postman collection
+```
+
+```mermaid
+flowchart LR
+  api --> application --> domain
+  infrastructure --> domain
+  infrastructure --> application
+```
+`domain` depends on nothing but the JDK and libphonenumber; `application` never depends on `api` or `infrastructure`. [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java) fails the build otherwise.
+
+## For developers
+
+```bash
+docker compose up -d postgres redpanda                 # only the database and broker
+./mvnw spring-boot:run -Dspring-boot.run.profiles=dev  # the API on localhost:8080 with a local-only signing key (stop the app container first)
+scripts/generate-export.sh --rows 200000               # a synthetic nightly file in data/generated/
+```
+- The application refuses to start without a token signing key (`rostersync.security.jwt-secret`, at least 32 bytes). The `dev` and `demo` profiles supply local-only ones.
+- Prometheus scrapes the `app` container. To watch an app started with `spring-boot:run` instead, stop the container (`docker compose stop app`) and change the target in [`prometheus.yml`](ops/prometheus/prometheus.yml) to `host.docker.internal:8080`.
+- At most three test application contexts (each with its own containers) are alive at a time ([`spring.properties`](src/test/resources/spring.properties)), so the full suite fits in Docker's memory next to the running stack.
 
 ## Glossary
 
