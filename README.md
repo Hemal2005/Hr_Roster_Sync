@@ -6,7 +6,7 @@ Companies keep their employee list in an HR system and send changes to MoveInSyn
 
 1. [Run it in 5 minutes](#run-it-in-5-minutes)
 2. [At a glance](#at-a-glance)
-3. [The problem in plain words](#the-problem-in-plain-words)
+3. [The problem](#the-problem)
 4. [The problems we solved](#the-problems-we-solved), each with how, the decisions, and how to test it
 5. [How it works — the big picture](#how-it-works--the-big-picture), and [where the core logic lives](#where-the-core-logic-lives)
 6. [The workflows, step by step](#the-workflows-step-by-step)
@@ -15,7 +15,7 @@ Companies keep their employee list in an HR system and send changes to MoveInSyn
 9. [Trade-offs: consistency vs availability vs latency](#trade-offs-consistency-vs-availability-vs-latency)
 10. [Security and tenant isolation](#security-and-tenant-isolation)
 11. [Failure handling](#failure-handling)
-12. [Monitoring — what on-call sees at 3 AM](#monitoring--what-on-call-sees-at-3-am)
+12. [Monitoring and alerting](#monitoring-and-alerting)
 13. [Caching](#caching)
 14. [Performance and cost](#performance-and-cost)
 15. [Data model](#data-model)
@@ -30,7 +30,7 @@ More: [testing guide](docs/testing-guide.md) · [tests by problem](docs/problem-
 
 ## Run it in 5 minutes
 
-### What you need
+### Requirements
 
 | | |
 |---|---|
@@ -56,13 +56,13 @@ docker compose up -d --build --wait
   # {"groups":["liveness","readiness"],"status":"UP"}
   ```
 
-### 2. Try it (pick one)
+### 2. Exercise the API (one of three ways)
 
 **A. The guided tour (recommended, about 30 seconds).** It walks through every rule against the running service and prints what happens:
 ```bash
 scripts/demo-tour.sh
 ```
-It covers a new joiner, a duplicate, changes out of order, a batch with bad records, HR vs transport fields, another client being refused, a booking cancelled by an exit, a normal night, a cut-off night held by the safety brake, and an operator approving a held night. Each step, with its expected output, is in [docs/curl-examples.md](docs/curl-examples.md). To check every rule yourself, in depth and one step at a time, follow the [testing guide](docs/testing-guide.md).
+It covers a new joiner, a duplicate, changes out of order, a batch with bad records, HR vs transport fields, another client being refused, a booking cancelled by an exit, a normal night, a cut-off night held by the safety brake, and an operator approving a held night. Each step, with its expected output, is in [docs/curl-examples.md](docs/curl-examples.md). Every rule, checked step by step with commands and outputs: [testing guide](docs/testing-guide.md).
 
 **B. Postman.** Import [docs/postman_collection.json](docs/postman_collection.json). Run the requests in folder **"0. Tokens"** first, which saves the tokens, then any request in folders 1–5.
 
@@ -84,7 +84,7 @@ curl -s -X POST localhost:8080/api/v1/hr/events:batch -H "Authorization: Bearer 
 
 ### 3. Look inside
 
-| Open | What you see |
+| URL | Shows |
 |---|---|
 | http://localhost:3000 | Grafana dashboard **HR Roster Sync**: records by outcome, rejections by code, ingest lag, outbox, brake trips, caches (no login needed to view) |
 | http://localhost:9090/alerts | Prometheus alert rules; after the tour, **ReconciliationBrakeTripped** is firing |
@@ -96,7 +96,7 @@ curl -s -X POST localhost:8080/api/v1/hr/events:batch -H "Authorization: Bearer 
 docker compose down        # stop; the data is kept
 docker compose down -v     # stop and delete all data (a clean start next time)
 ```
-Run `docker compose down -v` before running the tour a second time if you want exactly the outputs in [docs/curl-examples.md](docs/curl-examples.md).
+To reproduce the outputs in [docs/curl-examples.md](docs/curl-examples.md) exactly on a second run, reset first with `docker compose down -v`.
 
 ### If something goes wrong
 
@@ -112,7 +112,7 @@ Run `docker compose down -v` before running the tour a second time if you want e
 
 ### Demo data and identities
 
-> **The `demo` profile is for local evaluation only, and it is off unless you ask for it.** It turns on `POST /dev/token`, which hands out a token for any tenant and role, and it loads demo data. Its signing key comes from `ROSTERSYNC_SECURITY_JWT_SECRET`, which defaults to a demo key in `docker-compose.yml`. A real deployment runs without `demo` or `dev`, provides its own key, and gets tokens from its identity provider.
+> **The `demo` profile is for local evaluation only, and it is off unless explicitly enabled.** It turns on `POST /dev/token`, which hands out a token for any tenant and role, and it loads demo data. Its signing key comes from `ROSTERSYNC_SECURITY_JWT_SECRET`, which defaults to a demo key in `docker-compose.yml`. A real deployment runs without `demo` or `dev`, provides its own key, and gets tokens from its identity provider.
 
 **Demo data** ([`R__demo_seed.sql`](src/main/resources/db/demo/R__demo_seed.sql)):
 - tenants `acme` (offices `BLR-01`, `HYD-02`, and `PUN-03`, which is inactive) and `globex` (`BLR-01`, `CHN-01`);
@@ -155,7 +155,7 @@ Every case-study line is mapped to its proof in the [traceability matrix](docs/t
 
 Measured on one Apple M2 laptop (8 cores, 8 GB) running the app, database, broker and monitoring together; details in [Performance and cost](#performance-and-cost).
 
-## The problem in plain words
+## The problem
 
 A company with 200,000 employees uses MoveInSync to get its people to work by cab. MoveInSync has to know who works there, at which office, on which shift, and where to pick them up. The company's HR system tells it, in two ways: small updates through an API during the day ("Asha joined", "Ravi moved to Hyderabad", "Meera left"), and a full list of everyone every night.
 
@@ -178,7 +178,7 @@ Each problem from the case study, in the same shape:
 - **what goes wrong** in real life;
 - **how we solved it**;
 - **the decisions we made**, and what we chose not to do;
-- **how to see it yourself**;
+- **how to reproduce it**;
 - **how it's tested**, with the command to run that test.
 
 All test commands need JDK 21 (and Docker for integration tests); see [Testing: how to run every test](#testing).
@@ -198,7 +198,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | Keep each record as raw JSON until its turn | A record with a wrongly typed field (`"version": "abc"`) is rejected alone, instead of the whole request failing to parse | Parsing the whole body into typed objects up front |
   | Phone numbers must already be in E.164 (`+919876543210`) | Guessing the country of a local number could turn a valid number into someone else's | Normalising local formats |
   | Validators as small separate classes | Each rule is tested alone; a new rule is a new class | One large validation method |
-- **See it yourself.** [Guided tour step 4](docs/curl-examples.md#4-one-batch-several-bad-records): one batch, five records, four different rejection codes, and the good record applied.
+- **Reproduce.** [Guided tour step 4](docs/curl-examples.md#4-one-batch-several-bad-records): one batch, five records, four different rejection codes, and the good record applied.
 - **How it's tested.**
   - [`IngestControllerIT.oneBadRecordDoesNotFailBatch`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java): 1 bad phone in 100 → 99 applied, 1 `INVALID_PHONE`
   - [`IngestControllerIT.wronglyTypedFieldRejectsOnlyItsRecord`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java)
@@ -220,7 +220,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | Use HR's own per-employee version | HR already sends it; it identifies the *change*, not the request | An `Idempotency-Key` header: a re-sent batch with a new key would slip through |
   | Detect duplicates with the version rule, not a lookup table | One comparison inside the row lock handles duplicates and ordering together | A dedupe table read and written on every event |
   | Reject same-version-different-content | A version should identify one state; guessing could overwrite correct data | Last write wins |
-- **See it yourself.** [Tour step 2](docs/curl-examples.md#2-the-same-event-again-nothing-changes-idempotency).
+- **Reproduce.** [Tour step 2](docs/curl-examples.md#2-the-same-event-again-nothing-changes-idempotency).
 - **How it's tested.**
   - [`ReplayFeedTwiceIT`](src/test/java/com/moveinsync/rostersync/ReplayFeedTwiceIT.java): a shuffled 1,000-event feed sent twice; every row, column by column, and the change log are identical afterwards
   - [`ApplyServiceIT`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java): `duplicateIsNoOp`, `sameVersionWithDifferentContentIsRejectedAsConflict`
@@ -252,7 +252,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | Versions, not timestamps | Clocks drift; two changes can share a millisecond | Timestamps; arrival order |
   | Lock the row (pessimistic) for HR changes | Machine feeds often hit the same employee; a lock queues them, with no retry storms | Optimistic retries |
   | An update for an unknown employee creates them | v2 can arrive before v1, and it carries the full state | Rejecting it and losing the change |
-- **See it yourself.** [Tour step 3](docs/curl-examples.md#3-out-of-order-v3-arrives-before-v2-the-case-studys-example): v3 is applied, v2 is stale, and the employee ends on v3's office and shift.
+- **Reproduce.** [Tour step 3](docs/curl-examples.md#3-out-of-order-v3-arrives-before-v2-the-case-studys-example): v3 is applied, v2 is stale, and the employee ends on v3's office and shift.
 - **How it's tested.**
   - [`ExampleUseCaseIT.transferV7BeforeShiftV6`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java): the case study's example with its values
   - [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java): 32 threads send versions 1–200 shuffled for one employee: final version 200, each version applied once, nothing lost. Without the lock it fails
@@ -276,7 +276,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | Hand-written SQL for writes; the ORM (JPA) only for reads | JPA saves every mapped column, which would let HR write transport columns | Saving entities through JPA |
   | Ignore (and count) foreign fields from HR, but reject them from the admin | HR feeds are machines; blocking a valid record over an extra field would hold up real changes. An admin is a person who can fix the request | Rejecting both |
   | Optimistic `If-Match` for admin edits | Human edits are rare and slow; holding a lock while someone thinks is wrong | Locks for admin edits |
-- **See it yourself.** [Tour step 5](docs/curl-examples.md#5-field-ownership-hr-vs-the-transport-admin).
+- **Reproduce.** [Tour step 5](docs/curl-examples.md#5-field-ownership-hr-vs-the-transport-admin).
 - **How it's tested.**
   - [`ApplyServiceIT.hrCannotOverwriteTransportFields`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java)
   - [`EmployeeRepositoryIT.hrWritesNeverTouchTransportColumns`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/EmployeeRepositoryIT.java): checked at the database level
@@ -313,7 +313,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | Plan first, apply later | The safety brake (next problem) needs the full picture before anything happens | Applying while reading |
   | An invalid line counts as "present" | A typo in the file isn't evidence that someone left | Treating it as missing |
   | A missing employee is deactivated only if nothing changed since the file was taken, and keeps HR's version number | The live feed keeps running; an old file must never undo a newer live change, and HR's next real version must still apply | Inventing a new version for "missing" |
-- **See it yourself.** [Tour step 9](docs/curl-examples.md#9-the-nightly-file-a-normal-night). For a 200,000-row file: `scripts/generate-export.sh --rows 200000` (needs JDK 21), then upload it as in the [API reference](#nightly-reconciliation).
+- **Reproduce.** [Tour step 9](docs/curl-examples.md#9-the-nightly-file-a-normal-night). For a 200,000-row file: `scripts/generate-export.sh --rows 200000` (needs JDK 21), then upload it as in the [API reference](#nightly-reconciliation).
 - **How it's tested.**
   - [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java): 200,000 stored employees vs a 201,000-row file: plan in 3.0 s, plan + apply in 24.9 s, 127 MB peak on a 256 MB heap
   - [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java): every row of the comparison table
@@ -339,7 +339,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | A trailer with the row count | A truncated file otherwise looks like a smaller file | Trusting the row count |
   | Exact decimal arithmetic for the ratio | In floating point, 30 % of 10 isn't exactly 3, so the boundary would be wrong | `double` |
   | Upload returns at once (`202`), work runs in the background, one run at a time | A large file shouldn't hold a web request open; two runs at once would plan against changing data | Processing inside the request |
-- **See it yourself.** [Tour steps 10–11](docs/curl-examples.md#10-the-file-is-cut-off-the-safety-brake): a cut-off file is held and rejected; a file dropping almost half the staff is held and approved. Then open http://localhost:9090/alerts.
+- **Reproduce.** [Tour steps 10–11](docs/curl-examples.md#10-the-file-is-cut-off-the-safety-brake): a cut-off file is held and rejected; a file dropping almost half the staff is held and approved. Then open http://localhost:9090/alerts.
 - **How it's tested.**
   - [`ExampleUseCaseIT.truncatedFileAt120kDeactivatesNobody`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java): 200,000 employees, file cut at row 120,000 mid-line: held as `FILE_TRUNCATED`, 79,999 planned, **nobody** deactivated, even after rejection
   - [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java): thresholds and the exact 30 % boundary
@@ -366,7 +366,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | One active relay, stop at the first failure | Keeps each employee's events in order | Several relays skipping locked rows: they could reorder an employee's events |
   | Send in groups where no employee repeats | The load test showed one-at-a-time sending managed only 137 events/s; groups reach ≈ 7,000 with the same ordering | Sending a whole batch at once, which could reorder an employee's events on failure |
   | Events carry ids, versions and the *names* of changed fields, not values | Brokers keep messages and copy them to every consumer; personal data stays behind the API | Full records in events |
-- **See it yourself.** Stop the broker (`docker compose stop redpanda`), send an update (still `APPLIED`), watch "Outbox: oldest unsent" rise on the dashboard, then `docker compose start redpanda` and watch it drain. Or kill the app mid-traffic: `docker compose kill app`, then `docker compose up -d --wait app`.
+- **Reproduce.** Stop the broker (`docker compose stop redpanda`), send an update (still `APPLIED`), watch "Outbox: oldest unsent" rise on the dashboard, then `docker compose start redpanda` and watch it drain. Or kill the app mid-traffic: `docker compose kill app`, then `docker compose up -d --wait app`.
 - **How it's tested.**
   - [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java): **the process crashes between the database write and the publish**, before and after the broker received it; the effect still happens exactly once
   - [`OutboxIT.eventWrittenInSameTransaction`](src/test/java/com/moveinsync/rostersync/OutboxIT.java): a failing event write leaves no employee change behind
@@ -389,7 +389,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | React to the change event, separately from saving the change | Bookings are a different part of the business; ingest stays fast | Cancelling inside the HR change's transaction |
   | Remember handled event ids | A *late* copy of an old exit, arriving after the person was rehired and booked again, would otherwise cancel the new booking | Relying on cancellation being repeatable |
   | Cancel and free seats in one SQL statement | The two can never get out of step | Two separate updates |
-- **See it yourself.** [Tour step 8](docs/curl-examples.md#8-an-exit-cancels-the-cab-booking-change-events).
+- **Reproduce.** [Tour step 8](docs/curl-examples.md#8-an-exit-cancels-the-cab-booking-change-events).
 - **How it's tested.**
   - [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java): future cancelled, past kept, seats exact, redelivery ignored, `lateCopyOfAnOldExitDoesNotCancelBookingsMadeAfterRehire` (fails without the event-id check)
   - [`BookingApiIT.anExitSentByHrCancelsTheBookingEndToEnd`](src/test/java/com/moveinsync/rostersync/api/booking/BookingApiIT.java): through the real API, outbox and broker
@@ -435,7 +435,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | A separate role for the HR system | It's a machine; `ADMIN` would let it edit transport fields | Reusing `ADMIN` |
   | Deny by default | A new endpoint is closed until someone decides who may use it | Allow by default |
   | HS256 demo tokens from `/dev/token`, demo profile only | Easy local evaluation; production uses tokens from the company's identity provider | — |
-- **See it yourself.** [Tour step 6](docs/curl-examples.md#6-another-tenant-404-exactly-like-an-id-that-doesnt-exist).
+- **Reproduce.** [Tour step 6](docs/curl-examples.md#6-another-tenant-404-exactly-like-an-id-that-doesnt-exist).
 - **How it's tested.**
   - [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java): `anotherTenantsEmployeeLooksExactlyLikeAMissingOne`
   - [`SecurityIT`](src/test/java/com/moveinsync/rostersync/api/security/SecurityIT.java): missing, expired, forged and client-less tokens → 401; wrong role → 403; unknown paths denied
@@ -443,7 +443,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   - [`DevTokenAbsentIT`](src/test/java/com/moveinsync/rostersync/api/security/DevTokenAbsentIT.java): `/dev/token` doesn't exist without the demo or dev profile
   - Run: `./mvnw verify -Dit.test='TenantIsolationIT,SecurityIT' -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`
 
-### 11. On-call must see trouble at 3 AM
+### 11. On-call must be alerted when something goes wrong
 
 - **What goes wrong.** The broker has been down for an hour, a client started sending broken records, or last night's file is waiting for approval, and nobody knows until employees complain.
 - **How we solved it.**
@@ -458,7 +458,7 @@ All test commands need JDK 21 (and Docker for integration tests); see [Testing: 
   | Alert on symptoms someone must act on | CPU and memory are dashboard material, not pages | Alerting on resource usage |
   | Outbox depth read from the table when scraped | Correct across restarts and multiple instances | In-memory counters |
   | Labels: client, outcome, code only | Bounded series; nothing client-supplied or personal | Labelling by source system or employee id |
-- **See it yourself.** http://localhost:3000 after the tour; details in [Monitoring](#monitoring--what-on-call-sees-at-3-am).
+- **Reproduce.** http://localhost:3000 after the tour; details in [Monitoring](#monitoring-and-alerting).
 - **How it's tested.**
   - [`MetricsIT`](src/test/java/com/moveinsync/rostersync/MetricsIT.java): real traffic, then every series on `/actuator/prometheus`; other actuator endpoints stay closed
   - [`alerts.test.yml`](ops/prometheus/alerts.test.yml): every alert fires and resolves as specified, including "one rejection in a quiet hour is not a spike"
@@ -897,7 +897,7 @@ Every request carries a signed token (a JWT: a small JSON document signed with a
 
 ### Why another tenant's data answers 404, not 403
 
-`403 Forbidden` would confirm that the record exists, just not for you. That alone leaks information, for example whether a competitor employs someone with a given id. A request for another tenant's employee gets exactly the same `404` body as a request for an id that exists nowhere.
+`403 Forbidden` would confirm that the record exists and is only off-limits. That alone leaks information, for example whether a competitor employs someone with a given id. A request for another tenant's employee gets exactly the same `404` body as a request for an id that exists nowhere.
 
 Proof: [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java), and in it `anotherTenantsEmployeeLooksExactlyLikeAMissingOne`.
 
@@ -936,7 +936,7 @@ These fields are returned only to an authorised caller: an `ADMIN` of the same t
 
 More detail, with diagrams: [docs/design-note.md](docs/design-note.md).
 
-## Monitoring — what on-call sees at 3 AM
+## Monitoring and alerting
 
 `docker compose up --build --wait` (see [Run it](#run-it-in-5-minutes)) starts, next to the app:
 - **Prometheus** on [localhost:9090](http://localhost:9090), scraping the app's `/actuator/prometheus` every 15 s;

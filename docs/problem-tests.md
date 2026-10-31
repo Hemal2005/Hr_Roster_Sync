@@ -2,7 +2,7 @@
 
 For each of the twelve problems in the README, this page shows:
 1. **the data**: which tables and columns are involved, with example rows before and after;
-2. **the request**: the URL to call, the example payload and the response you get back;
+2. **the request**: the URL to call, the example payload and the response;
 3. **the tests**: a direct GitHub link to every test method that proves the rule, with what it proves and the command to run it.
 
 Back to the [README](../README.md) · the step-by-step [testing guide](testing-guide.md) · the [traceability matrix](traceability.md).
@@ -19,10 +19,10 @@ Back to the [README](../README.md) · the step-by-step [testing guide](testing-g
 | 8 | [People who leave must lose their cab bookings](#8-people-who-leave-must-lose-their-cab-bookings) | `GET /api/v1/bookings?employeeId=` | [`DeactivationConsumerIT.lateCopyOfAnOldExitDoesNotCancelBookingsMadeAfterRehire`](https://github.com/Hemal2005/Hr_Roster_Sync/blob/main/src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java#L126) |
 | 9 | [Personal data must never leak](#9-personal-data-must-never-leak) | `POST /api/v1/hr/events:batch` | [`NoPiiInLogsIT.noPersonalValueReachesLogsMetricsOrErrorBodies`](https://github.com/Hemal2005/Hr_Roster_Sync/blob/main/src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java#L93) |
 | 10 | [One client never sees another's data; each person only what their role allows](#10-one-client-never-sees-anothers-data-each-person-only-what-their-role-allows) | `GET /api/v1/employees/{id}` | [`TenantIsolationIT.anotherTenantsEmployeeLooksExactlyLikeAMissingOne`](https://github.com/Hemal2005/Hr_Roster_Sync/blob/main/src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java#L61) |
-| 11 | [On-call must see trouble at 3 AM](#11-on-call-must-see-trouble-at-3-am) | `GET /actuator/prometheus` | [`MetricsIT.everyMonitoringSeriesIsExposed`](https://github.com/Hemal2005/Hr_Roster_Sync/blob/main/src/test/java/com/moveinsync/rostersync/MetricsIT.java#L85) |
+| 11 | [On-call must be alerted when something goes wrong](#11-on-call-must-be-alerted-when-something-goes-wrong) | `GET /actuator/prometheus` | [`MetricsIT.everyMonitoringSeriesIsExposed`](https://github.com/Hemal2005/Hr_Roster_Sync/blob/main/src/test/java/com/moveinsync/rostersync/MetricsIT.java#L85) |
 | 12 | [It must stay fast, and reads must not hammer the database](#12-it-must-stay-fast-and-reads-must-not-hammer-the-database) | `GET /api/v1/employees/{id}` | [`EmployeeReadCacheIT.aStaleETagFromTheCacheCannotOverwriteANewerTransportEdit`](https://github.com/Hemal2005/Hr_Roster_Sync/blob/main/src/test/java/com/moveinsync/rostersync/api/employee/EmployeeReadCacheIT.java#L82) |
 
-## Before you start
+## Setup
 
 **The data model in one table.** Every table's key starts with `tenant_id` (the client), so one client's rows can never be addressed by another. Schema: [`src/main/resources/db/migration/`](https://github.com/Hemal2005/Hr_Roster_Sync/tree/main/src/main/resources/db/migration); diagram: README [Data model](../README.md#data-model).
 
@@ -36,14 +36,14 @@ Back to the [README](../README.md) · the step-by-step [testing guide](testing-g
 | `processed_message` | an event a consumer has already acted on | `(consumer, event_id)` | 8 |
 | `reconciliation_run`, `_item`, `_error` | one nightly file; its planned changes; its bad lines (line + code only) | `status`, counts, `brake_reason` | 5, 6 |
 
-**Start the system and load the helpers.** Everything below runs against the one-command stack. Start it fresh so your numbers match this page:
+**Starting the system.** Everything below runs against the one-command stack. A fresh start makes the numbers match this page:
 ```bash
 docker compose down -v && docker compose up -d --build --wait
 bash
 ```
-Then paste the helper block from the testing guide, [Module 0](testing-guide.md#module-0-start-fresh-and-load-the-helpers). It defines `tok`, `ev`, `send`, `show`, `night`, `upload`, `runinfo` and the tokens `$HR`, `$ADMIN`, `$OPS`, `$GLOBEX_HR`, `$GLOBEX_ADMIN`. The problems below build on each other in order (1 → 12), like a real day. Outputs are from a real run; only ids, trace ids and timestamps differ.
+The shell helpers come from the testing guide, [Module 0](testing-guide.md#module-0-start-fresh-and-load-the-helpers), which defines `tok`, `ev`, `send`, `show`, `night`, `upload`, `runinfo` and the access tokens (JWT) `$HR`, `$ADMIN`, `$OPS`, `$GLOBEX_HR`, `$GLOBEX_ADMIN`. The problems build on each other in order (1 → 12). Outputs are from a reference run; only ids, trace ids and timestamps differ.
 
-**Run any linked test yourself** (JDK 21; Docker for the `…IT` classes):
+**Running a linked test** (JDK 21; Docker for the `…IT` classes):
 ```bash
 ./mvnw test   -Dtest='ClassName#methodName'                                                   # a unit test (…Test)
 ./mvnw verify -Dit.test='ClassName#methodName' -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false   # an integration test (…IT)
@@ -567,7 +567,7 @@ Code: [`TenantArgumentResolver.resolveArgument`](https://github.com/Hemal2005/Hr
 
 ---
 
-## 11. On-call must see trouble at 3 AM
+## 11. On-call must be alerted when something goes wrong
 
 **The rule.** The numbers on-call needs are exposed as metrics; five alert rules page a person; logs are JSON lines tied together by a trace id.
 
@@ -582,7 +582,7 @@ Code: [`TenantArgumentResolver.resolveArgument`](https://github.com/Hemal2005/Hr
 | `hr_owned_field_violation_total` | `tenant`, `field` | transport fields sent by HR | — |
 | `cache_gets_total` | `cache`, `result` | cache hits and misses | — |
 
-**The requests.** Your own trace id through to the log; then `GET http://localhost:8080/actuator/prometheus` and `GET http://localhost:9090/api/v1/alerts`:
+**The requests.** A chosen trace id followed to its log line; then `GET http://localhost:8080/actuator/prometheus` and `GET http://localhost:9090/api/v1/alerts`:
 ```bash
 curl -s -D - -o /dev/null -X POST $BASE/api/v1/hr/events:batch -H "Authorization: Bearer $HR" -H 'Content-Type: application/json' \
   -H 'X-Trace-Id: reviewer-trace-0001' -d "{\"sourceSystem\":\"workday\",\"events\":[$(ev UPDATE E1002 3 BLR-01 DAY ',"email":"bad"')]}" | grep -i '^x-trace-id'
@@ -636,7 +636,7 @@ cache_gets_total{cache="employees",result="miss"} 6.0
 cache_gets_total{cache="offices",result="hit"} 26.0
 cache_gets_total{cache="offices",result="miss"} 5.0
 ```
-The exact counts depend on what you ran before; each pair of reads adds one `employees` miss, then one hit. Office lookups are almost all hits: 26 of 31 here, after the batches and nightly files of problems 1–10. The load test passes when both thresholds show `✓` (p99 < 2 s, < 1 % failed). Measured on the test laptop: 5,858 records/s, p99 556 ms per 50-record batch (full results: README [Performance and cost](../README.md#performance-and-cost)).
+The exact counts depend on the earlier requests; each pair of reads adds one `employees` miss, then one hit. Office lookups are almost all hits: 26 of 31 here, after the batches and nightly files of problems 1–10. The load test passes when both thresholds show `✓` (p99 < 2 s, < 1 % failed). Measured on the test laptop: 5,858 records/s, p99 556 ms per 50-record batch (full results: README [Performance and cost](../README.md#performance-and-cost)).
 
 **The tests.**
 
