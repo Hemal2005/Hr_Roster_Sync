@@ -78,19 +78,19 @@ sequenceDiagram
     participant K as Kafka
     participant C as DeactivationHandler
     HR->>API: batch [E42 v7 (exit), ...] with JWT
-    API->>API: tenant from token; parse each record on its own
+    API->>API: tenant from token, parse each record on its own
     API->>A: apply(record)
     A->>A: validate (office from cache)
-    A->>DB: BEGIN; SELECT ... FOR UPDATE (E42)
+    A->>DB: BEGIN, SELECT ... FOR UPDATE (E42)
     A->>A: version rule: stored v6 < 7 → APPLY
-    A->>DB: UPDATE HR columns WHERE hr_version < 7; INSERT event log; INSERT outbox; COMMIT
+    A->>DB: UPDATE HR columns WHERE hr_version < 7, INSERT event log, INSERT outbox, COMMIT
     A-->>API: APPLIED
     API-->>HR: per-record results (no field values)
     R->>DB: lock oldest unsent (one active relay)
     R->>K: send keyed tenant:E42, await ack
     R->>DB: mark sent
     K->>C: EMPLOYEE_DEACTIVATED
-    C->>DB: BEGIN; record event id (dedupe); cancel future bookings, free seats; COMMIT
+    C->>DB: one transaction: record event id (dedupe), cancel future bookings, free seats, COMMIT
 ```
 
 ## 5. Sequence: the nightly file, the brake and approval
@@ -104,7 +104,7 @@ sequenceDiagram
     participant B as SafetyBrake
     participant O as Operator
     participant A as ApplyService
-    HR->>API: upload file (header: tenant, as_of; trailer: count)
+    HR->>API: upload file (header: tenant and as_of, trailer: row count)
     API->>API: header names the caller's tenant?
     API-->>HR: 202 {runId}
     API->>P: plan (background thread)
@@ -116,7 +116,7 @@ sequenceDiagram
     end
     P->>B: activeBefore, toDeactivate, trailerOk
     alt trailer missing, or toDeactivate / activeBefore >= 0.30
-        B-->>DB: AWAITING_APPROVAL (metric + alert; nothing applied)
+        B-->>DB: AWAITING_APPROVAL (metric + alert, nothing applied)
         O->>API: GET run, GET errors
         alt approve
             O->>API: POST approve

@@ -1396,7 +1396,7 @@ sequenceDiagram
     API->>API: verify token, tenant = acme
     API->>A: record 0
     A->>A: validate (office BLR-01 is active)
-    A->>DB: BEGIN; lock E1001 (none yet); INSERT employee; INSERT event log; INSERT outbox; COMMIT
+    A->>DB: one transaction: lock E1001 (none yet), INSERT employee, event log row, outbox row, COMMIT
     A-->>API: APPLIED
     API-->>HR: {"results":[{"index":0,"employeeId":"E1001","outcome":"APPLIED"}]}
 ```
@@ -1455,7 +1455,7 @@ sequenceDiagram
     participant P as Planner
     participant DB as PostgreSQL
     participant A as Apply
-    HR->>API: upload file (header: tenant, as_of; trailer: count)
+    HR->>API: upload file (header: tenant and as_of, trailer: row count)
     API-->>HR: 202 {runId}
     P->>P: pass 1: read rows, validate, hash, write to 64 bucket files
     loop each bucket
@@ -1479,9 +1479,9 @@ sequenceDiagram
     participant OP as Operator
     participant A as Apply
     P->>P: 120,000 rows, a half-written last line, no trailer
-    P->>B: activeBefore 200,000; toDeactivate 79,999; trailer missing
+    P->>B: activeBefore 200,000, toDeactivate 79,999, trailer missing
     B-->>P: TRIP: FILE_TRUNCATED → AWAITING_APPROVAL
-    Note over P,A: nothing applied; alert "ReconciliationBrakeTripped" fires
+    Note over P,A: nothing applied, alert ReconciliationBrakeTripped fires
     OP->>P: GET run (numbers), GET errors (line 120,003 MALFORMED_RECORD)
     alt reject
         OP->>P: POST reject → REJECTED, nobody touched
@@ -1506,7 +1506,7 @@ sequenceDiagram
     A->>DB: E1001 INACTIVE + outbox EMPLOYEE_DEACTIVATED (one commit)
     R->>K: publish (key acme:E1001), wait for the broker's ack, mark sent
     K->>C: EMPLOYEE_DEACTIVATED
-    C->>DB: BEGIN; remember event id; cancel future bookings; free seats; COMMIT
+    C->>DB: one transaction: remember event id, cancel future bookings, free seats, COMMIT
     K->>C: the same event again (redelivery)
     C->>C: event id already seen → nothing
 ```
