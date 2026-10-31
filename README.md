@@ -30,13 +30,11 @@ More: [design note](docs/design-note.md) (architecture, sequences, failure modes
 
 ## Run it in 5 minutes
 
-This is everything a reviewer needs. There's nothing to install except Docker.
-
 ### What you need
 
 | | |
 |---|---|
-| **Docker** | [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS or Windows, or Docker Engine with Compose v2 on Linux. Give it **at least 4 GB of memory** (Settings → Resources) |
+| **Docker** | [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS or Windows, or Docker Engine with Compose v2 on Linux. Give it **at least 6 GB of memory** (Settings → Resources) |
 | **Free ports** | 8080 (API), 3000 (Grafana), 9090 (Prometheus), 5432 (PostgreSQL), 19092 (Kafka) |
 | **For the guided tour** (optional) | `bash`, `curl` and `python3`. macOS and Linux have them; on Windows use Git Bash or WSL, or use Postman instead |
 
@@ -106,7 +104,7 @@ Run `docker compose down -v` before running the tour a second time if you want e
 |---|---|
 | `Cannot connect to the Docker daemon` | Start Docker Desktop and wait until it says it's running |
 | `port is already allocated` / `address already in use` | Another program uses that port (often a local PostgreSQL on 5432). Stop it, or change the left-hand port in `docker-compose.yml` (for example `"5433:5432"`) |
-| A container shows `unhealthy` or exits with code 137 | Docker is out of memory: give it at least 4 GB, then `docker compose up -d --wait` again |
+| A container shows `unhealthy` or exits with code 137 | Docker is out of memory: give it at least 6 GB, then `docker compose up -d --wait` again |
 | `--wait` isn't recognised | An older Compose: run `docker compose up -d --build`, wait a minute, then check health with the `curl` above |
 | `scripts/demo-tour.sh: Permission denied` | `bash scripts/demo-tour.sh` |
 | Tour outputs differ from the docs | The data from an earlier run is still there: `docker compose down -v`, then start again |
