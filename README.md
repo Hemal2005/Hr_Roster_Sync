@@ -27,19 +27,234 @@ Companies keep their employee list in an HR system and send changes to MoveInSyn
 
 ## At a glance
 
-_Pending._
+| Hard rule from the case study | Status | Proof (a test that fails if the rule breaks) |
+|---|---|---|
+| Validate at the boundary; one bad record never fails a batch | Done | [`IngestControllerIT.oneBadRecordDoesNotFailBatch`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java) |
+| Apply each employee's changes in version order; ignore older ones | Done | [`ExampleUseCaseIT.transferV7BeforeShiftV6`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java), [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java) |
+| The same change twice changes nothing (idempotency) | Done | [`ReplayFeedTwiceIT`](src/test/java/com/moveinsync/rostersync/ReplayFeedTwiceIT.java) |
+| HR never overwrites what the transport team owns | Done | [`ApplyServiceIT.hrCannotOverwriteTransportFields`](src/test/java/com/moveinsync/rostersync/application/ApplyServiceIT.java), [`EmployeeRepositoryIT.hrWritesNeverTouchTransportColumns`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/EmployeeRepositoryIT.java) |
+| Compare the nightly file efficiently, not fully in memory | Done | [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java) (200,000 rows on a 256 MB heap) |
+| Safety brake: never deactivate 30 % or more without a person | Done | [`ExampleUseCaseIT.truncatedFileAt120kDeactivatesNobody`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java) |
+| Publish every change reliably, even across a crash (outbox) | Done | [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java), [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java) |
+| An exit cancels future cab bookings and frees seats | Done | [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java) |
+| No personal data in logs | Done | [`NoPiiInLogsIT`](src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java) |
+| One client can never see another's data | Done | [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java) |
+
+Every case-study line is mapped to its proof in the [traceability matrix](docs/traceability.md).
+
+| Headline number | Value |
+|---|---|
+| Nightly comparison of 200,000 employees (plan) | **3.0 s** |
+| Peak memory during it, whole application included | **127 MB** of a 256 MB heap |
+| Live ingest throughput | **5,858 records/s** |
+| p99 latency of a 50-record batch under that load | **556 ms** |
+
+Measured on one Apple M2 laptop (8 cores, 8 GB) running the app, database, broker and monitoring together; details in [Performance and cost](#performance-and-cost).
 
 ## The problem in plain words
 
-_Pending._
+A company with 200,000 employees uses MoveInSync to get its people to work by cab. MoveInSync has to know who works there, at which office, on which shift, and where to pick them up. The company's HR system tells it, in two ways: small updates through an API during the day ("Asha joined", "Ravi moved to Hyderabad", "Meera left"), and a full list of everyone every night.
+
+In the real world those messages misbehave:
+
+| What happens | What it costs if nothing guards against it |
+|---|---|
+| The same update arrives twice (a retry after a timeout) | Two cab bookings, double notifications, or a "change" that undoes a newer one |
+| Updates arrive in the wrong order (v7 before v6) | Ravi's transfer is overwritten by his older shift change, and a cab goes to the wrong office |
+| A record is broken (bad phone number, unknown office code) | If one bad record fails the whole batch, 999 good changes are lost with it |
+| HR's update carries old transport data | The pickup point the transport team just fixed is overwritten, and the cab waits at the old gate |
+| The nightly file is cut off at row 120,000 of 200,000 | 80,000 people look like they left: their accounts are deactivated and their cabs cancelled |
+| The service crashes right after saving a change | The booking system never hears about an exit, and a cab still waits for someone who has left |
+
+This service keeps the employee records correct through all of that. Where something is too risky to decide alone, as with the cut-off file, it stops and asks a person.
 
 ## How it works — the big picture
 
-_Pending._
+```mermaid
+flowchart LR
+  HR["HR system"] -->|"1 live updates"| API["Ingest API"]
+  API -->|"2"| V["Validation<br/>(per record)"]
+  V -->|"3"| AP["Apply<br/>(version rule)"]
+  AP -->|"4 one transaction"| DB[("PostgreSQL<br/>employee + outbox")]
+  DB -->|"5"| R["Outbox relay"]
+  R -->|"6"| K[["Kafka topic<br/>employee changes"]]
+  K -->|"7"| BC["Booking consumer"]
+  BC -->|"8 cancel bookings"| DB
+  HR -->|"9 nightly file"| REC["Reconciliation<br/>(plan in buckets)"]
+  REC -->|"10"| BR{"Safety brake"}
+  BR -->|"11 passes"| AP
+  BR -->|"12 trips"| OP["Operator<br/>approve / reject"]
+  OP -->|"13 approve"| AP
+  ADM["Transport admin"] -->|"14 pickup point"| DB
+```
+
+1. The HR system sends a batch of changes, signed with a token that names the client (tenant).
+2. Each record is checked on its own: required fields, email, phone format, office code. A bad record is rejected with a code; the rest carry on.
+3. The apply step locks that employee's row and compares versions: newer is applied, same is a duplicate, older is ignored.
+4. The change, a record of it, and a change event (the "outbox" row) are saved in **one** database transaction, so they can never disagree.
+5. A background relay picks up unsent change events in order.
+6. It publishes them to a Kafka topic, keyed by employee so each employee's events stay in order, and marks them sent only once the broker confirms.
+7. The booking consumer reads the events.
+8. For an exit, it cancels that person's future bookings and frees the seats, exactly once even if an event arrives twice.
+9. Every night HR uploads the full list of employees.
+10. The comparison is planned first, bucket by bucket so memory stays small, and the plan is checked by the safety brake.
+11. If the file is complete and would deactivate fewer than 30 % of active staff, the plan is applied through the same apply step as live changes.
+12. Otherwise nothing is applied; an alert fires and the run waits.
+13. An operator reviews the numbers and approves (the plan is applied, skipping anyone who changed meanwhile) or rejects it.
+14. The transport admin edits pickup points and special-assistance notes. Those fields belong to transport, and HR can never overwrite them.
+
+Code layers (enforced by [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java)): `api` (HTTP) → `application` (use cases, transactions) → `domain` (the rules, plain Java) ← `infrastructure` (database, Kafka, caches). The rules can be tested without a server or database.
 
 ## The workflows, step by step
 
-_Pending._
+### a. A real-time update arrives
+
+```mermaid
+sequenceDiagram
+    participant HR as HR system
+    participant API as Ingest API
+    participant A as Apply
+    participant DB as PostgreSQL
+    HR->>API: POST /hr/events:batch [E1001 v1 CREATE]
+    API->>API: verify token, tenant = acme
+    API->>A: record 0
+    A->>A: validate (office BLR-01 is active)
+    A->>DB: BEGIN; lock E1001 (none yet); INSERT employee; INSERT event log; INSERT outbox; COMMIT
+    A-->>API: APPLIED
+    API-->>HR: {"results":[{"index":0,"employeeId":"E1001","outcome":"APPLIED"}]}
+```
+1. The token is verified, and the tenant is taken from it, never from the request body.
+2. The record is validated on its own.
+3. One transaction stores the employee, the applied-change record and the change event.
+4. The answer lists every record's outcome. Real output: [curl examples §1](docs/curl-examples.md#1-a-new-joiner-arrives).
+
+### b. Updates arrive twice or out of order (the case study's example)
+
+E000042 is at version 5 (office BLR-01, shift MORNING). HR then makes two changes: v6 (shift → NIGHT) and v7 (transfer to HYD-02, still NIGHT). v7 arrives first.
+
+```mermaid
+sequenceDiagram
+    participant HR as HR system
+    participant A as Apply
+    participant DB as PostgreSQL
+    HR->>A: v7 (HYD-02, NIGHT)
+    A->>DB: lock E000042: stored v5
+    A->>A: 7 > 5 → APPLY
+    A->>DB: office HYD-02, shift NIGHT, version 7
+    HR->>A: v6 (BLR-01, NIGHT)
+    A->>DB: lock E000042: stored v7
+    A->>A: 6 < 7 → STALE, ignored
+    HR->>A: v7 again (a retry)
+    A->>A: 7 = 7, same content → DUPLICATE, nothing written
+```
+1. Every event carries the employee's **full** HR state, so v7 already contains the NIGHT shift that v6 introduced. Ignoring v6 loses nothing.
+2. The final state is HYD-02 / NIGHT / v7, whatever order the events arrive in.
+3. Proof: [`ExampleUseCaseIT.transferV7BeforeShiftV6`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java), and with 32 threads racing shuffled versions, [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java).
+
+### c. HR and the transport admin edit the same employee
+
+```mermaid
+sequenceDiagram
+    participant HR as HR system
+    participant ADM as Transport admin
+    participant DB as PostgreSQL
+    ADM->>DB: PATCH pickupPoint "Gate 2" (If-Match "0")
+    DB-->>ADM: 200, ETag "1" (transport version 1)
+    HR->>DB: v4 with pickupPoint "Gate 9" + office change
+    DB-->>HR: APPLIED: office changed, pickupPoint ignored and counted
+    ADM->>DB: PATCH with the old If-Match "0"
+    DB-->>ADM: 412 TRANSPORT_VERSION_MISMATCH
+```
+1. HR's update and the admin's edit use separate SQL statements and separate version counters. HR's statement cannot write a transport column.
+2. A transport field sent by HR is ignored and counted (`hr_owned_field_violation_total`); the record still applies.
+3. Two admins can't silently overwrite each other: an edit must name the version it was based on.
+
+### d. The nightly file — a normal night
+
+```mermaid
+sequenceDiagram
+    participant HR as HR system
+    participant API as Reconciliation API
+    participant P as Planner
+    participant DB as PostgreSQL
+    participant A as Apply
+    HR->>API: upload file (header: tenant, as_of; trailer: count)
+    API-->>HR: 202 {runId}
+    P->>P: pass 1: read rows, validate, hash, write to 64 bucket files
+    loop each bucket
+        P->>DB: read the same bucket of stored employees
+        P->>P: compare: create / update / deactivate
+    end
+    P->>P: brake: trailer OK, 0 of 1 active missing → pass
+    P->>A: apply 10 creates
+    A->>DB: same rules as live updates
+```
+1. Unchanged employees (same version, same content hash) produce nothing.
+2. Only one bucket (about 1/64 of the file) is in memory at a time.
+3. Real output: [curl examples §9](docs/curl-examples.md#9-the-nightly-file-a-normal-night).
+
+### e. The nightly file is cut off at row 120,000 (the safety brake)
+
+```mermaid
+sequenceDiagram
+    participant P as Planner
+    participant B as Safety brake
+    participant OP as Operator
+    participant A as Apply
+    P->>P: 120,000 rows, a half-written last line, no trailer
+    P->>B: activeBefore 200,000; toDeactivate 79,999; trailer missing
+    B-->>P: TRIP: FILE_TRUNCATED → AWAITING_APPROVAL
+    Note over P,A: nothing applied; alert "ReconciliationBrakeTripped" fires
+    OP->>P: GET run (numbers), GET errors (line 120,003 MALFORMED_RECORD)
+    alt reject
+        OP->>P: POST reject → REJECTED, nobody touched
+    else approve
+        OP->>A: POST approve → each change re-checked against live data, then applied
+    end
+```
+1. The brake trips when the trailer is missing or wrong, **or** when 30 % or more of the active employees would be deactivated.
+2. The half-written line counts as present, so 79,999 deactivations are planned, not 80,000.
+3. Approving later is safe: anyone who changed through the live feed since the file was taken is skipped.
+4. Proof: [`ExampleUseCaseIT.truncatedFileAt120kDeactivatesNobody`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java) with 200,000 real rows; real API output: [curl examples §10–11](docs/curl-examples.md#10-the-file-is-cut-off-the-safety-brake).
+
+### f. An employee leaves
+
+```mermaid
+sequenceDiagram
+    participant A as Apply
+    participant DB as PostgreSQL
+    participant R as Relay
+    participant K as Kafka
+    participant C as Booking consumer
+    A->>DB: E1001 INACTIVE + outbox EMPLOYEE_DEACTIVATED (one commit)
+    R->>K: publish (key acme:E1001), wait for the broker's ack, mark sent
+    K->>C: EMPLOYEE_DEACTIVATED
+    C->>DB: BEGIN; remember event id; cancel future bookings; free seats; COMMIT
+    K->>C: the same event again (redelivery)
+    C->>C: event id already seen → nothing
+```
+1. Bookings on trips that already ran stay as history.
+2. Proof: [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java), including a late duplicate after a rehire.
+
+### g. The process crashes right after saving
+
+```mermaid
+sequenceDiagram
+    participant A as Apply
+    participant DB as PostgreSQL
+    participant R as Relay
+    participant K as Kafka
+    A->>DB: change + outbox row, COMMIT
+    Note over A,R: crash here: the outbox row is still unsent
+    R->>DB: (after restart) oldest unsent rows
+    R->>K: publish, ack
+    Note over R,DB: crash here: sent but not marked
+    R->>K: (after restart) publish again
+    Note over K: the consumer drops the duplicate by event id
+```
+1. Because the change and its event are saved together, a crash can delay an event but never lose one.
+2. A crash between publishing and marking sends it twice, and consumers keep a list of handled event ids. The result: delivered at least once, acted on exactly once.
+3. Proof: [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java) (both crash points). For a real container kill: `docker compose kill app`, then `docker compose up -d --wait app`. The data is intact and the outbox drains.
 
 ## The rules, explained
 
@@ -218,11 +433,47 @@ Each rule from the case study: what it says, what goes wrong without it, how it 
 
 ## Design decisions
 
-_Pending._
+| # | Decision | Why | Alternative considered | What we gave up |
+|---|---|---|---|---|
+| D1 | Java 21 + Spring Boot 4, Maven wrapper | Records, sealed types and pattern matching for the domain; the standard Java service stack | Go, Kotlin, Gradle | More boilerplate and memory than Go |
+| D2 | PostgreSQL as the single source of truth | The change and its event in one ACID transaction; row locks, `SKIP LOCKED`, JSONB | MongoDB, MySQL | One primary: a write ceiling and a failover concern |
+| D3 | Kafka protocol, served by Redpanda | Ordered per key, replayable; one light container for the demo | RabbitMQ, direct HTTP to bookings | Redpanda locally vs Kafka in production (same client, no code change) |
+| D4 | Events carry the full HR state | Ignoring an older event loses nothing | Deltas with per-field versions | Bigger payloads; HR must send whole records |
+| D5 | Per-employee version from HR; apply / duplicate / conflict / stale | One comparison gives order and idempotency | Timestamps, arrival order, a dedupe table per event | Relies on HR's versions being correct |
+| D6 | Idempotency key `(tenant, source system, employee, version)` | The natural key HR already sends; unique index in the event log | `Idempotency-Key` header per request | Two HR systems for one employee are not supported |
+| D7 | Field ownership by separate write paths and versions | HR's SQL cannot touch transport columns | `if` checks in code, one version per row | Two version columns, two endpoints |
+| D8 | One transaction per record on ingest | One bad record can't undo the batch | One transaction per batch, async inbox | Latency per batch |
+| D9 | Nightly diff in 64 hash buckets, two passes | Memory O(n / 64) | Two in-memory maps, sort-merge, SQL diff in a staging table | Temporary disk, two passes |
+| D10 | Plan first, then apply | The brake judges a complete plan; nothing to undo | Apply while reading, roll back on trip | The plan is stored; a delay before apply |
+| D11 | Apply the plan through the live apply path | A file taken at 02:00 can't overwrite a live change from 02:05 | A separate bulk write path | Slower than a bulk update |
+| D12 | Transactional outbox + one ordered relay | Change and event never disagree; per-employee order | Dual write, Debezium (CDC), Kafka transactions | ≤ 200 ms latency; one relay is the ceiling |
+| D13 | Booking side effects in an idempotent consumer | Separate concern; dedupe by event id in the same transaction | Cancel inside the apply transaction | Cancellations are ~1 s later (eventual) |
+| D14 | JWT with roles; tenant only from the token; 404 across tenants | Stateless; no tenant spoofing; existence isn't leaked | Sessions, API keys, tenant in the URL | HS256 demo key; production uses RS256 from an identity provider |
+| D15 | `tenant_id` in every key and every repository method | Impossible to write a query that forgets the tenant | Postgres row-level security | Verbose signatures |
+| D16 | In-process Caffeine caches, read paths only | Fewer repeated reads, bounded staleness | Redis, no cache | Per-instance staleness (≤ 30 s / 5 min) |
+| D17 | RFC 7807 problem details with stable codes | Clients branch on `code`; no personal data | Ad-hoc error bodies | — |
+| D18 | Micrometer → Prometheus → Grafana; JSON logs with trace id | Standard, alertable, searchable | OpenTelemetry collector | Two more containers |
+| D19 | Strong consistency for the roster, eventual downstream | A wrong roster is worse than a short refusal | Accept writes without the database | Ingest is down while the database is |
+| D20 | Layered design with a framework-free domain, enforced by a test | Rules tested in milliseconds; can't drift into frameworks | Controller–service–repository with JPA entities as the model | Mapping code between layers |
+
+**The three that matter most.**
+- **The version rule (D4 + D5).** Ordering, duplicates and retries are all handled by one comparison on full-state events, inside a row lock. There is no clock to trust and no separate dedupe store on the hot path. The cost is a dependency on HR's versions being right, so a reset at HR would show up as a spike in `STALE` and needs an operational fix.
+- **The outbox (D12).** It's the only way to make "save" and "tell the others" atomic without a distributed transaction. The relay keeps per-employee order even after the [load-test-driven change](#performance-and-cost) that pipelines sends: one employee never has two events in flight.
+- **Plan, then brake (D9 + D10 + D11).** Nothing from the nightly file is applied until the whole file is known to be complete and plausible. Even then, every change goes through the same version rule as live updates, so an old file can never undo a newer live change.
 
 ## Trade-offs: consistency vs availability vs latency
 
-_Pending._
+| Data | Consistency | How long "eventually" is in practice |
+|---|---|---|
+| Employee record (HR and transport fields) | **Strong.** One Postgres primary, row locks, conditional updates | Visible to every database read on commit |
+| Admin read endpoints | Read-your-writes on the same instance; another instance's change shows within 30 s (cache) | ≤ 30 s |
+| Office codes in validation | A new office is valid at once; a deactivated one may still be accepted | ≤ 5 min |
+| Change events and booking cancellations | **Eventual**, at least once, deduplicated | Relay poll ≤ 200 ms + broker; under ~5,900 records/s of load the oldest unsent event waited at most 6.6 s |
+| Nightly file | Applied only when the brake passes, or after an operator approves | Minutes normally; hours when held, by design |
+
+- **Availability vs correctness.** When the database is down, ingest refuses instead of accepting changes it can't store safely (a CP choice for the roster). HR systems retry, and versions make retries harmless. When the broker is down, ingest keeps working: events wait in the outbox and drain in order.
+- **Latency vs safety.** One transaction per record costs latency (about 150 ms per 50-record batch under load) but guarantees one bad record can't undo the others. The outbox adds up to 200 ms before downstream hears about a change.
+- **Why this is acceptable for cab rosters.** Cabs are planned minutes to hours ahead. A booking cancelled a second after the exit is fine; a roster that is wrong, or an exit that is silently lost, is not.
 
 ## Security and tenant isolation
 
@@ -271,7 +522,23 @@ These fields are returned only to an authorised caller: an `ADMIN` of the same t
 
 ## Failure handling
 
-_Pending._
+| What fails | What the user sees | How the system recovers | Proof |
+|---|---|---|---|
+| Database down | Requests fail (500, or `PROCESSING_FAILED` per record); nothing half-written | HR retries; versions make retries harmless | [`OutboxIT.afterAFailedRecordTheNextOneStillApplies`](src/test/java/com/moveinsync/rostersync/OutboxIT.java) |
+| Broker down | Nothing: ingest keeps answering `APPLIED` | Events queue in the outbox; the relay retries the oldest with backoff; `OutboxNotDraining` pages after 60 s; the backlog drains in order | [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java) |
+| Crash between saving and publishing | Nothing | The event is still unsent; the relay sends it after restart | [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java) |
+| Crash between publishing and marking sent | Nothing | Sent again; the consumer drops the duplicate | [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java) |
+| Duplicate messages | `DUPLICATE`, no change, no event | Version rule; consumer dedupe by event id | [`ReplayFeedTwiceIT`](src/test/java/com/moveinsync/rostersync/ReplayFeedTwiceIT.java), [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java) |
+| Out-of-order messages | `STALE` for the older one | Version rule over full-state events | [`ExampleUseCaseIT`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java), [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java) |
+| Bad rows | `REJECTED` + code for that record only | Per-record parsing, validation and transaction | [`IngestControllerIT`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java) |
+| Truncated nightly file | Run held: `AWAITING_APPROVAL`, `FILE_TRUNCATED` | Nothing applied; alert; operator rejects or approves | [`ExampleUseCaseIT.truncatedFileAt120kDeactivatesNobody`](src/test/java/com/moveinsync/rostersync/ExampleUseCaseIT.java) |
+| Operator never approves | The run stays held; nothing changes | The next file is planned against live data as usual; the held run can still be rejected | [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java) |
+| Approval long after the plan | Some changes reported as `skipped` | Each change is re-checked against live data under the row lock | [`ReconciliationIT.approvalLaterStillRespectsLiveChangesMadeInBetween`](src/test/java/com/moveinsync/rostersync/application/reconciliation/ReconciliationIT.java) |
+| Stale cache | An older view for ≤ 30 s, or a deactivated office for ≤ 5 min | TTL expiry; writes never read the cache; a stale ETag gets `412` | [`EmployeeReadCacheIT`](src/test/java/com/moveinsync/rostersync/api/employee/EmployeeReadCacheIT.java), [`OfficeCacheTest`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/OfficeCacheTest.java) |
+| App container killed | Requests fail until it restarts (about 6 s here) | Committed data and unsent events survive; the relay resumes | `docker compose kill app` drill; [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java) |
+| Crash during a nightly run | The run stays `RUNNING` | Nothing is half-applied (one transaction per employee); uploading the file again is safe | Known limit; see [Deliberately left out](#deliberately-left-out) |
+
+More detail, with diagrams: [docs/design-note.md](docs/design-note.md).
 
 ## Monitoring — what on-call sees at 3 AM
 
@@ -371,9 +638,9 @@ Machine: Apple M2 (8 cores), 8 GB RAM, macOS 27.0.1. Docker 28.1.1 with 8 CPUs a
 | Stored employees | 200,000 |
 | Tonight's file | 201,000 employees with 1,000 changed, 1,000 missing (199,995 rows) |
 | Plan | 995 creates, 1,000 updates, 1,000 deactivations, 0 conflicts |
-| Planning (both passes, plan stored) | **3.0 s** |
-| Planning + applying 2,995 changes | **25.3 s** (budget: 60 s) |
-| Peak heap, Spring context included | **109 MB** of 256 MB |
+| Planning (both passes, plan stored) | **3.0 s** (2,955 ms) |
+| Planning + applying 2,995 changes | **24.9 s** (budget: 60 s) |
+| Peak heap, Spring context included | **127 MB** of 256 MB (109 MB before the caches and metrics were added) |
 
 Machine: as above (tests on Temurin 21.0.13).
 
@@ -451,6 +718,21 @@ Nightly reconciliation ([`V4__reconciliation.sql`](src/main/resources/db/migrati
 ## API reference
 
 All endpoints are under `/api/v1`, take and return JSON, and need a bearer token. The client (tenant) is taken from the token's `tenant_id` claim, never from the URL or body.
+
+| Method and path | Role | Purpose |
+|---|---|---|
+| `POST /api/v1/hr/events:batch` | `HR_INTEGRATION` | Up to 1,000 HR events, a result per record |
+| `GET /api/v1/employees/{id}` | `ADMIN` | One employee; `ETag` = transport version |
+| `GET /api/v1/employees/me` | `EMPLOYEE` | Own record (id from the token) |
+| `PATCH /api/v1/employees/{id}/transport` | `ADMIN` | Pickup point and special assistance; `If-Match` required |
+| `POST /api/v1/bookings`, `GET /api/v1/bookings?employeeId=` | `ADMIN` | Book a seat; list bookings |
+| `POST /api/v1/reconciliations` | `HR_INTEGRATION`, `OPERATOR` | Upload a nightly file → `202 {runId}` |
+| `GET /api/v1/reconciliations/{id}`, `…/errors` | `OPERATOR` | A run and its bad lines |
+| `POST /api/v1/reconciliations/{id}/approve`, `…/reject` | `OPERATOR` | Decide a held run |
+| `POST /dev/token` | none (demo/dev profiles only) | A token for any demo identity |
+| `GET /actuator/health`, `GET /actuator/prometheus` | none | Health; metrics |
+
+Every request with real output: [docs/curl-examples.md](docs/curl-examples.md). Postman: [docs/postman_collection.json](docs/postman_collection.json) (run its "0. Tokens" folder first).
 
 ### `POST /api/v1/hr/events:batch`
 
@@ -608,6 +890,23 @@ curl -s -X POST localhost:8080/api/v1/hr/events:batch -H "Authorization: Bearer 
 # {"results":[{"index":0,"employeeId":"E000042","outcome":"APPLIED"}]}
 ```
 
+### A 5-minute guided tour
+
+```bash
+scripts/demo-tour.sh
+```
+On a fresh stack, it runs every rule through the real API in order:
+- a joiner, a duplicate, and v3-before-v2;
+- a batch with bad records;
+- field ownership with `If-Match`;
+- the cross-tenant 404;
+- a booking cancelled by an exit;
+- a normal night;
+- a **truncated night** that the brake holds and the operator rejects;
+- a night that drops half the staff, held and then approved.
+
+Each step's command and its real output are in [docs/curl-examples.md](docs/curl-examples.md).
+
 Stop it with `docker compose down`, which keeps the data; `docker compose down -v` also deletes the volumes.
 
 ### Developing (JDK 21 + Docker)
@@ -631,20 +930,124 @@ scripts/loadtest.sh                                    # k6 ingest load test aga
 
 ## Project structure
 
-_Pending._
+```
+src/main/java/com/moveinsync/rostersync/
+├── api/                 HTTP: controllers, request/response shapes, errors (ProblemDetail), trace ids
+│   ├── ingest/          POST /hr/events:batch, one result per record
+│   ├── employee/        GET employee, GET /me, PATCH transport fields with If-Match
+│   ├── booking/         minimal bookings, to show what an exit does
+│   ├── reconciliation/  nightly file upload, runs, approve / reject
+│   └── security/        JWT verification, roles, tenant from the token, /dev/token (dev/demo only)
+├── application/         use cases and transactions: ApplyService, outbox relay, booking consumer, caches
+│   └── reconciliation/  file reader, two-pass planner, applier, run service and runner
+├── domain/              the rules, plain Java: events, Employee, version policy, field ownership, outbox port
+│   ├── validation/      required fields, email, phone (E.164), office code
+│   └── reconciliation/  safety brake, bucket assignment (murmur3), the per-bucket diff
+└── infrastructure/
+    ├── persistence/     JDBC writes per owner, JPA reads, outbox, reconciliation store, office cache, gauges
+    └── messaging/       Kafka publisher and the change-event listener
+src/main/resources/db/   Flyway migrations (migration/), demo seed (demo/, demo profile only)
+src/test/java/…          unit tests next to their packages; *IT integration tests; support/ and tools/
+ops/                     Prometheus config, alert rules and their tests; Grafana provisioning and dashboard
+loadtest/, scripts/      k6 load test; export generator, demo tour, alert checks, load test runner
+docs/                    design note, traceability matrix, curl examples, Postman collection
+```
+
+```mermaid
+flowchart LR
+  api --> application --> domain
+  infrastructure --> domain
+  infrastructure --> application
+```
+`domain` depends on nothing but the JDK and libphonenumber; `application` never depends on `api` or `infrastructure`. [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java) fails the build otherwise.
 
 ## Testing strategy
 
-_Pending._
+| Kind | What it proves | Examples | Run |
+|---|---|---|---|
+| Unit (177) | Every business rule in isolation, in milliseconds, with no server or database | [`VersionPolicyTest`](src/test/java/com/moveinsync/rostersync/domain/VersionPolicyTest.java), [`SafetyBrakeTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/SafetyBrakeTest.java), [`ReconciliationDifferTest`](src/test/java/com/moveinsync/rostersync/domain/reconciliation/ReconciliationDifferTest.java), [`OfficeCacheTest`](src/test/java/com/moveinsync/rostersync/infrastructure/persistence/OfficeCacheTest.java) | `./mvnw test` |
+| Architecture | The layers stay as designed | [`ArchitectureTest`](src/test/java/com/moveinsync/rostersync/ArchitectureTest.java) | `./mvnw test` |
+| Integration (158) | The full application against real PostgreSQL 16 and a real Kafka-compatible broker (Testcontainers) | [`IngestControllerIT`](src/test/java/com/moveinsync/rostersync/api/ingest/IngestControllerIT.java), [`ReconciliationApiIT`](src/test/java/com/moveinsync/rostersync/api/reconciliation/ReconciliationApiIT.java), [`TenantIsolationIT`](src/test/java/com/moveinsync/rostersync/TenantIsolationIT.java) | `./mvnw verify` |
+| Concurrency | No lost or reordered update under contention: 32 threads, shuffled versions 1–200 for one employee | [`ConcurrentApplyIT`](src/test/java/com/moveinsync/rostersync/ConcurrentApplyIT.java) | `./mvnw verify` |
+| Failure injection | Crashes at both outbox crash points, a broker outage, a failing record mid-batch, a late duplicate after a rehire | [`OutboxCrashRecoveryIT`](src/test/java/com/moveinsync/rostersync/OutboxCrashRecoveryIT.java), [`BrokerDownIT`](src/test/java/com/moveinsync/rostersync/infrastructure/messaging/BrokerDownIT.java), [`DeactivationConsumerIT`](src/test/java/com/moveinsync/rostersync/DeactivationConsumerIT.java) | `./mvnw verify` |
+| Data protection | No seeded personal value appears in any log line, metric or error body | [`NoPiiInLogsIT`](src/test/java/com/moveinsync/rostersync/NoPiiInLogsIT.java) | `./mvnw verify` |
+| Benchmark | 200,000 rows within 60 s on a 256 MB heap | [`ReconciliationBenchmarkIT`](src/test/java/com/moveinsync/rostersync/ReconciliationBenchmarkIT.java) | `./mvnw verify -Pbenchmark` |
+| Alert rules | Each alert fires and resolves as specified | [`alerts.test.yml`](ops/prometheus/alerts.test.yml) | `scripts/check-alerts.sh` |
+| Load | Throughput and latency under sustained real changes | [`loadtest/ingest.js`](loadtest/ingest.js) | `scripts/loadtest.sh` |
+| End to end | Every rule through the real HTTP API on the one-command stack | [`scripts/demo-tour.sh`](scripts/demo-tour.sh), output in [curl examples](docs/curl-examples.md) | `scripts/demo-tour.sh` |
+
+- One test class: `./mvnw test -Dtest=VersionPolicyTest`. One integration test: `./mvnw verify -Dit.test=TenantIsolationIT -Dtest=None -Dsurefire.failIfNoSpecifiedTests=false`.
+- The tests for the key guarantees were checked to fail when the guarded code is broken: without the consumer's dedupe table, without the row lock, with a changed alert threshold, and with the personal-data leak the PII test found.
+- Every case-study line maps to its proof in the [traceability matrix](docs/traceability.md).
 
 ## Assumptions
 
-_Pending._
+| Assumption | If it were wrong |
+|---|---|
+| Every HR event carries the employee's **full** HR state | With deltas, ignoring a stale event could lose a change. We would need per-field versions or an adapter that rebuilds full records |
+| HR gives each employee a version that only increases | A reset would make every update look `STALE` (visible as a spike); it needs a one-off reset or an epoch prefix |
+| One HR system per employee | Two systems would share one version counter. We would need per-source fields and versions |
+| HR owns name, email, phone, manager, office, **shift** and status; transport owns pickup point and special assistance | Changing an owner means moving the field between write paths (a documented recipe), not adding `if`s |
+| An HR system is a machine client with its own role, `HR_INTEGRATION` | Giving it `ADMIN` would let it edit transport fields |
+| Phone numbers arrive in international E.164 format (`+919876543210`) | Guessing a country for local numbers could turn a valid number into someone else's; normalisation would need the tenant's default country |
+| An update for an unknown employee creates them; an exit with full data for an unknown employee creates them inactive | Events can arrive before the create. An exit with no data for an unknown employee is rejected (`UNKNOWN_EMPLOYEE`) |
+| The nightly file has a header (tenant, `as_of`) and a trailer with the row count | Without a trailer, a cut-off file can't be told from a smaller one, and the brake would rely on the ratio alone |
+| `as_of` is when HR took the snapshot; live changes after it win | If `as_of` were wrong (too late), a stale file could deactivate someone rehired in between |
+| Office codes are maintained outside this service (seeded per tenant) | An office API would be needed; the cache rules stay the same |
+| 30 % is the right brake threshold for every tenant | It is configurable (`rostersync.reconciliation.brake-threshold`), but globally, not per tenant |
+| Times are UTC ISO-8601 | Local times without an offset would make `as_of` comparisons wrong |
 
 ## Deliberately left out
 
-_Pending._
+| Left out | Why | What it would take |
+|---|---|---|
+| A real identity provider (RS256 tokens) | Local evaluation uses HS256 demo tokens from `/dev/token`; verification code is the same | Point the resource server at the provider's key set |
+| PostgreSQL row-level security | Tenant isolation is enforced in every key and method, and tested | Policies per table and a per-connection tenant setting, as defence in depth |
+| Change data capture (Debezium) | The polling relay is simpler to run and reaches ≈ 7,000 events/s here | Kafka Connect + Debezium on the database log |
+| Partitioned relays | One active relay is enough for this load | Relays owning a hash range of employees each |
+| Async ingest (accept now, apply later) | Synchronous per-record results are simpler for HR to consume | An inbox table, workers by employee hash, a status API |
+| Per-tenant brake thresholds | One configured threshold covers the case study | A threshold column per tenant |
+| Multi-region | Out of scope for a roster service of this size | Regional databases, or one primary with failover |
+| Shared cache (Redis) or cross-instance eviction | Staleness is bounded and stated; writes never read the cache | Evict on change events, or a shared cache |
+| Sweeping runs left `RUNNING` by a crash | Nothing is half-applied and re-uploading is safe | Mark stale runs `FAILED` at startup |
+| A `503 Retry-After` when the database is down | Clients already retry safely on any failure | A health-aware exception mapping |
+| A management port for health and metrics | They hold no personal data | `management.server.port` on an internal network |
+| Retention for the event log and outbox | Not needed at demo scale | Partition by month; drop old partitions |
+| A user interface | The case study asks for the backend | — |
 
 ## Glossary
 
-_Pending._
+| Term | Meaning |
+|---|---|
+| Tenant | One corporate client; every record belongs to exactly one |
+| HR-owned / transport-owned field | Who is allowed to change a field: the client's HR system, or MoveInSync's transport team |
+| Version | A number HR attaches to each change of an employee; higher is newer |
+| Idempotency | Doing the same thing twice has the same effect as doing it once |
+| Duplicate / stale / conflict | Same version and content again / an older version / same version with different content |
+| Full-state event | A change message carrying all of an employee's HR fields, not only what changed |
+| Batch | Up to 1,000 HR events in one request, each handled on its own |
+| Transaction | A group of database writes that all happen or none do |
+| Row lock (`SELECT … FOR UPDATE`) | Makes other writers for the same employee wait until this one finishes |
+| Optimistic concurrency, ETag, If-Match | "Change this only if it's still the version I saw"; the version travels in the `ETag` / `If-Match` headers |
+| Outbox | A table of change events written in the same transaction as the change |
+| Relay | The background job that publishes outbox rows and marks them sent |
+| Kafka, topic, partition, key | A message log; a named stream; an ordered shard; what decides the shard (here: the employee) |
+| At least once / exactly once in effect | Never lost, maybe repeated / repeats are recognised and ignored |
+| Consumer, dedupe | A reader of events; remembering which events were already handled |
+| Reconciliation | Comparing the nightly full list with stored records and fixing the differences |
+| Bucket | One of 64 slices of employees, by a hash of the employee id, so the comparison fits in memory |
+| Content hash | A short fingerprint of an employee's HR fields; equal hashes mean nothing changed |
+| Trailer | The file's last line, stating how many rows it should have |
+| `as_of` | When HR took the nightly snapshot |
+| Safety brake | Holds a nightly plan that is truncated or would deactivate 30 % or more of active staff |
+| Operator | A person who approves or rejects a held nightly run |
+| JWT, role, claim | A signed token; what the caller may do; a field inside the token (such as `tenant_id`) |
+| ProblemDetail (RFC 7807) | A standard JSON shape for errors, with a stable `code` |
+| Trace id | An id on every log line of one request, also returned to the caller |
+| Personal data (PII) | Names, emails, phones, pickup points, assistance notes: never in logs, metrics or errors |
+| Cache, TTL | A short-lived copy of data; how long a copy may be used |
+| Metric, alert | A number Prometheus collects; a rule that pages someone when a number is wrong |
+| p50 / p99 | Half / 99 % of requests were faster than this |
+| Testcontainers | Real PostgreSQL and Kafka started in Docker for the tests |
+| Flyway migration | A versioned SQL script that builds the database schema |
+| Demo profile | A local-only setting that adds demo data and `/dev/token` |
