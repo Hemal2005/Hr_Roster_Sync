@@ -24,7 +24,7 @@ Back to the [README](../README.md) · the step-by-step [testing guide](testing-g
 
 ## Setup
 
-**The data model in one table.** Every table's key starts with `tenant_id` (the client), so one client's rows can never be addressed by another. Schema: [`src/main/resources/db/migration/`](https://github.com/Hemal2005/Hr_Roster_Sync/tree/main/src/main/resources/db/migration); diagram: README [Data model](../README.md#data-model).
+**The data model in one table.** Every client-owned table's key starts with `tenant_id` (the client), so one client's rows can never be addressed by another. The message tables `outbox` and `processed_message` are keyed by their own id and by event id. Schema: [`src/main/resources/db/migration/`](https://github.com/Hemal2005/Hr_Roster_Sync/tree/main/src/main/resources/db/migration); diagram: README [Data model](../README.md#data-model).
 
 | Table | One row is | Key columns | Used by problems |
 |---|---|---|---|

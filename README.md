@@ -1046,7 +1046,7 @@ Machine: as above (tests on Temurin 21.0.13).
 
 ## Data model
 
-Every table carries the client's id (`tenant_id`), and every key starts with it, so a row can only be reached together with the client it belongs to. The schema is created by Flyway from [`V1__core_schema.sql`](src/main/resources/db/migration/V1__core_schema.sql); the application never creates tables itself.
+Every client-owned table carries the client's id (`tenant_id`), and its key starts with it, so a row can only be reached together with the client it belongs to. The two message tables are the exception: `outbox` is keyed by its own sequence (it still records `tenant_id`), and `processed_message` by event id, which is unique across clients. The schema is created by Flyway from the migrations in [`db/migration/`](src/main/resources/db/migration/); the application never creates tables itself.
 
 ```mermaid
 erDiagram
@@ -1054,6 +1054,11 @@ erDiagram
     tenant ||--o{ employee : employs
     office ||--o{ employee : "works at"
     employee ||--o{ employee_event_log : "applied changes"
+    employee ||..o{ outbox : "change events, no FK"
+    tenant ||--o{ trip : runs
+    office ||--o{ trip : "departs from"
+    trip ||--o{ booking : "seats on"
+    employee ||--o{ booking : holds
 
     tenant {
         text id PK
@@ -1092,6 +1097,39 @@ erDiagram
         text outcome
         timestamptz received_at
     }
+    outbox {
+        bigserial id PK "publish order"
+        uuid event_id UK
+        text tenant_id
+        text aggregate_id "employee_id"
+        text event_type
+        jsonb payload
+        timestamptz created_at
+        timestamptz published_at "null until sent"
+        int attempts
+        text last_error_code
+    }
+    trip {
+        text tenant_id PK,FK
+        text id PK
+        text office_code FK
+        timestamptz pickup_time
+        int capacity
+        int seats_booked
+    }
+    booking {
+        text tenant_id PK,FK
+        text id PK
+        text trip_id FK
+        text employee_id FK
+        text status "BOOKED or CANCELLED"
+        text cancel_reason
+    }
+    processed_message {
+        text consumer PK
+        uuid event_id PK
+        timestamptz processed_at
+    }
 ```
 
 | Table | What it holds |
@@ -1100,8 +1138,9 @@ erDiagram
 | `office` | A client's office codes. An event naming an office that is missing or inactive is rejected. |
 | `employee` | The current state of each employee. HR-owned and transport-owned columns are written by separate statements, each checking its own version (`hr_version`, `transport_version`), so neither owner can overwrite the other. `bucket` is `floorMod(murmur3(employee_id), 64)`, the slice of the nightly comparison the employee belongs to. |
 | `employee_event_log` | One row per applied HR change. The unique key `(tenant_id, source_system, employee_id, version)` means the database itself refuses to record the same change twice (idempotency). |
-
-Tables for change events, bookings and nightly reconciliation are added by later migrations, alongside the code that uses them.
+| `outbox` | One row per change event ([`V2__outbox.sql`](src/main/resources/db/migration/V2__outbox.sql)). It is written in the same transaction as the `employee` change it describes, so the two can never disagree. The relay publishes unsent rows in `id` order and sets `published_at` once the broker has acknowledged them; `attempts` and `last_error_code` record failed sends. |
+| `trip`, `booking` | A cab trip with its seat count, and one employee's seat on it ([`V3__trips_bookings_processed_messages.sql`](src/main/resources/db/migration/V3__trips_bookings_processed_messages.sql)). Just enough to show what an exit does downstream: the employee's `BOOKED` seats become `CANCELLED`. The database allows one live seat per employee per trip and never more seats than `capacity`. |
+| `processed_message` | Event ids a consumer has already acted on. Delivery is at least once, so the consumer records the id in the same transaction as its side effect and skips ids it has seen. |
 
 Nightly reconciliation ([`V4__reconciliation.sql`](src/main/resources/db/migration/V4__reconciliation.sql)):
 
