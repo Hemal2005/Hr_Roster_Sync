@@ -1,0 +1,548 @@
+{
+  "info": {
+    "name": "HR Roster Sync",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Every endpoint of HR Roster Sync against the one-command stack (docker compose up --build --wait). Run '0. Tokens' first: each request stores its token in a collection variable. /dev/token exists only under the demo and dev profiles."
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "hrToken",
+      "value": ""
+    },
+    {
+      "key": "adminToken",
+      "value": ""
+    },
+    {
+      "key": "opsToken",
+      "value": ""
+    },
+    {
+      "key": "employeeToken",
+      "value": ""
+    },
+    {
+      "key": "globexAdminToken",
+      "value": ""
+    },
+    {
+      "key": "runId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Tokens (demo profile)",
+      "item": [
+        {
+          "name": "HR system (acme, HR_INTEGRATION)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"hrToken\", pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenantId\": \"acme\", \"subject\": \"workday\", \"roles\": [\"HR_INTEGRATION\"]}"
+            },
+            "url": "{{baseUrl}}/dev/token"
+          }
+        },
+        {
+          "name": "Transport admin (acme, ADMIN)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"adminToken\", pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenantId\": \"acme\", \"subject\": \"admin-1\", \"roles\": [\"ADMIN\"]}"
+            },
+            "url": "{{baseUrl}}/dev/token"
+          }
+        },
+        {
+          "name": "Operator (acme, OPERATOR)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"opsToken\", pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenantId\": \"acme\", \"subject\": \"ops-1\", \"roles\": [\"OPERATOR\"]}"
+            },
+            "url": "{{baseUrl}}/dev/token"
+          }
+        },
+        {
+          "name": "Employee E1001 (acme, EMPLOYEE)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"employeeToken\", pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenantId\": \"acme\", \"subject\": \"E1001\", \"roles\": [\"EMPLOYEE\"]}"
+            },
+            "url": "{{baseUrl}}/dev/token"
+          }
+        },
+        {
+          "name": "Admin of another tenant (globex, ADMIN)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"globexAdminToken\", pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenantId\": \"globex\", \"subject\": \"admin-1\", \"roles\": [\"ADMIN\"]}"
+            },
+            "url": "{{baseUrl}}/dev/token"
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. HR events",
+      "item": [
+        {
+          "name": "New joiner",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/hr/events:batch",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sourceSystem\": \"workday\",\n  \"events\": [\n    {\n      \"type\": \"CREATE\",\n      \"employeeId\": \"E1001\",\n      \"version\": 1,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1001@acme.example\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"BLR-01\",\n      \"shiftCode\": \"DAY\"\n    }\n  ]\n}"
+            },
+            "description": "Expect APPLIED. Send it again: DUPLICATE."
+          }
+        },
+        {
+          "name": "v3 before v2 (out of order)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/hr/events:batch",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sourceSystem\": \"workday\",\n  \"events\": [\n    {\n      \"type\": \"UPDATE\",\n      \"employeeId\": \"E1001\",\n      \"version\": 3,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1001@acme.example\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"HYD-02\",\n      \"shiftCode\": \"NIGHT\"\n    },\n    {\n      \"type\": \"UPDATE\",\n      \"employeeId\": \"E1001\",\n      \"version\": 2,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1001@acme.example\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"BLR-01\",\n      \"shiftCode\": \"NIGHT\"\n    }\n  ]\n}"
+            },
+            "description": "Expect APPLIED for v3 and STALE for v2; the employee ends at v3."
+          }
+        },
+        {
+          "name": "Batch with bad records",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/hr/events:batch",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sourceSystem\": \"workday\",\n  \"events\": [\n    {\n      \"type\": \"CREATE\",\n      \"employeeId\": \"E1002\",\n      \"version\": 1,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1002@acme.example\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"BLR-01\",\n      \"shiftCode\": \"DAY\"\n    },\n    {\n      \"type\": \"CREATE\",\n      \"employeeId\": \"E1003\",\n      \"version\": 1,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"not-an-email\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"BLR-01\",\n      \"shiftCode\": \"DAY\"\n    },\n    {\n      \"type\": \"CREATE\",\n      \"employeeId\": \"E1004\",\n      \"version\": 1,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1004@acme.example\",\n      \"phone\": \"98765\",\n      \"officeCode\": \"BLR-01\",\n      \"shiftCode\": \"DAY\"\n    },\n    {\n      \"type\": \"CREATE\",\n      \"employeeId\": \"E1005\",\n      \"version\": 1,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1005@acme.example\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"PUN-03\",\n      \"shiftCode\": \"DAY\"\n    }\n  ]\n}"
+            },
+            "description": "E1002 APPLIED; INVALID_EMAIL, INVALID_PHONE, UNKNOWN_OFFICE (PUN-03 is inactive) for the others."
+          }
+        },
+        {
+          "name": "HR sends a transport field (ignored)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/hr/events:batch",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sourceSystem\": \"workday\",\n  \"events\": [\n    {\n      \"type\": \"UPDATE\",\n      \"employeeId\": \"E1001\",\n      \"version\": 4,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1001@acme.example\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"HYD-02\",\n      \"shiftCode\": \"NIGHT\",\n      \"pickupPoint\": \"Gate 9\"\n    }\n  ]\n}"
+            },
+            "description": "APPLIED; pickupPoint is ignored and counted in hr_owned_field_violation_total."
+          }
+        },
+        {
+          "name": "Exit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/hr/events:batch",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"sourceSystem\": \"workday\",\n  \"events\": [\n    {\n      \"type\": \"DEACTIVATE\",\n      \"employeeId\": \"E1001\",\n      \"version\": 5,\n      \"occurredAt\": \"2026-10-30T08:00:00Z\",\n      \"firstName\": \"Asha\",\n      \"lastName\": \"Rao\",\n      \"email\": \"e1001@acme.example\",\n      \"phone\": \"+919876543210\",\n      \"officeCode\": \"HYD-02\",\n      \"shiftCode\": \"NIGHT\"\n    }\n  ]\n}"
+            },
+            "description": "Cancels E1001's future bookings through the change event."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Employees",
+      "item": [
+        {
+          "name": "Admin reads an employee",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/employees/E1001",
+            "description": "The ETag header is the transport version; use it as If-Match."
+          }
+        },
+        {
+          "name": "Employee reads own record",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{employeeToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/employees/me"
+          }
+        },
+        {
+          "name": "Another tenant reads E1001 (404)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{globexAdminToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/employees/E1001"
+          }
+        },
+        {
+          "name": "Admin edits transport fields",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"0\""
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/employees/E1001/transport",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pickupPoint\": \"Gate 2, Tech Park\",\n  \"specialAssistance\": \"none\"\n}"
+            },
+            "description": "200 with the new ETag. Repeat with the same If-Match: 412. Without If-Match: 428."
+          }
+        },
+        {
+          "name": "Admin tries an HR-owned field (400)",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "If-Match",
+                "value": "\"1\""
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/employees/E1001/transport",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"officeCode\": \"BLR-01\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Bookings",
+      "item": [
+        {
+          "name": "Book a seat",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/bookings",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tripId\": \"T-ACME-1\",\n  \"employeeId\": \"E1001\"\n}"
+            },
+            "description": "Do this before the exit in folder 1 to see the cancellation."
+          }
+        },
+        {
+          "name": "List an employee's bookings",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/bookings?employeeId=E1001"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Nightly reconciliation",
+      "item": [
+        {
+          "name": "Upload a nightly file",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{hrToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reconciliations",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": ""
+                }
+              ]
+            },
+            "description": "Pick a CSV made with scripts/generate-export.sh (or the format in docs/curl-examples.md). Returns 202 and stores runId."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"runId\", pm.response.json().runId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get the run",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opsToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reconciliations/{{runId}}"
+          }
+        },
+        {
+          "name": "Bad lines of the run",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opsToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reconciliations/{{runId}}/errors?page=0"
+          }
+        },
+        {
+          "name": "Approve a held run",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opsToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reconciliations/{{runId}}/approve"
+          }
+        },
+        {
+          "name": "Reject a held run",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{opsToken}}"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/reconciliations/{{runId}}/reject"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Operations",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/actuator/health"
+          }
+        },
+        {
+          "name": "Prometheus metrics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/actuator/prometheus"
+          }
+        }
+      ]
+    }
+  ]
+}
