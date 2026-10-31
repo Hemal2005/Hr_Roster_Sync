@@ -60,19 +60,19 @@ class IngestController {
 
 	private RecordResult ingestOne(TenantId tenantId, String sourceSystem, int index, JsonNode node) {
 		if (node == null || !node.isObject()) {
-			return rejected(index, null, ErrorCode.MALFORMED_RECORD);
+			return rejected(tenantId, index, null, ErrorCode.MALFORMED_RECORD);
 		}
 		HrEventRequest request;
 		try {
 			request = json.treeToValue(node, HrEventRequest.class);
 		} catch (JacksonException e) {
-			return rejected(index, null, ErrorCode.MALFORMED_RECORD);
+			return rejected(tenantId, index, null, ErrorCode.MALFORMED_RECORD);
 		}
 		HrEventType type;
 		try {
 			type = request.type() == null ? null : HrEventType.valueOf(request.type().toUpperCase(Locale.ROOT));
 		} catch (IllegalArgumentException e) {
-			return rejected(index, request.employeeId(), ErrorCode.INVALID_EVENT_TYPE);
+			return rejected(tenantId, index, request.employeeId(), ErrorCode.INVALID_EVENT_TYPE);
 		}
 		countForeignFields(tenantId, node);
 		ApplyResult result = applyService.apply(tenantId, sourceSystem, request.toIncoming(type));
@@ -99,7 +99,14 @@ class IngestController {
 		}
 	}
 
-	private static RecordResult rejected(int index, String employeeId, ErrorCode code) {
-		return new RecordResult(index, employeeId, ApplyResult.rejected(code).outcome(), code);
+	/**
+	 * A record rejected before it reaches the apply service still counts in hr_events, so
+	 * the rejection rate on the dashboard includes unreadable records.
+	 */
+	private RecordResult rejected(TenantId tenantId, int index, String employeeId, ErrorCode code) {
+		ApplyResult result = ApplyResult.rejected(code);
+		meters.counter("hr.events", "tenant", tenantId.value(), "outcome", result.outcome().name(), "code", code.name())
+				.increment();
+		return new RecordResult(index, employeeId, result.outcome(), code);
 	}
 }

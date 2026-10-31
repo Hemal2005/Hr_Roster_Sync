@@ -88,7 +88,9 @@ class MetricsIT extends ApiTest {
 				create("E1", 1, "BLR-01", "DAY"),
 				create("E2", 1, "BLR-01", "DAY"),
 				with(create("E3", 1, "BLR-01", "DAY"), "email", "not-an-email"),
-				create("E4", 1, "NOPE-9", "DAY")));
+				create("E4", 1, "NOPE-9", "DAY"),
+				with(create("E5", 1, "BLR-01", "DAY"), "version", "abc"),
+				with(create("E6", 1, "BLR-01", "DAY"), "type", "PROMOTE")));
 		ingest(List.of(
 				create("E1", 1, "BLR-01", "DAY"),
 				with(update("E2", 3, "HYD-02", "DAY"), "pickupPoint", "Gate 1")));
@@ -109,6 +111,8 @@ class MetricsIT extends ApiTest {
 				.contains("hr_events_total{application=\"hr-roster-sync\",code=\"NONE\",outcome=\"APPLIED\",tenant=\"acme\"}")
 				.contains("code=\"INVALID_EMAIL\",outcome=\"REJECTED\"")
 				.contains("code=\"UNKNOWN_OFFICE\",outcome=\"REJECTED\"")
+				.contains("code=\"MALFORMED_RECORD\",outcome=\"REJECTED\"")
+				.contains("code=\"INVALID_EVENT_TYPE\",outcome=\"REJECTED\"")
 				.contains("code=\"NONE\",outcome=\"DUPLICATE\"")
 				.contains("code=\"NONE\",outcome=\"STALE\"")
 				.contains("hr_ingest_lag_seconds_bucket{")
