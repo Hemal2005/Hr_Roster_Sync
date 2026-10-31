@@ -26,7 +26,7 @@ Companies keep their employee list in an HR system and send changes to MoveInSyn
 20. [For developers](#for-developers)
 21. [Glossary](#glossary)
 
-More: [testing guide](docs/testing-guide.md) · [design note](docs/design-note.md) (architecture, sequences, failure modes) · [traceability matrix](docs/traceability.md) · [curl examples](docs/curl-examples.md) · [Postman collection](docs/postman_collection.json)
+More: [testing guide](docs/testing-guide.md) · [tests by problem](docs/problem-tests.md) · [design note](docs/design-note.md) (architecture, sequences, failure modes) · [traceability matrix](docs/traceability.md) · [curl examples](docs/curl-examples.md) · [Postman collection](docs/postman_collection.json)
 
 ## Run it in 5 minutes
 
@@ -844,6 +844,8 @@ The full **[testing guide](docs/testing-guide.md)** has two parts:
 - **[Verify every rule by hand](docs/testing-guide.md#part-1-verify-every-rule-by-hand):** 20 short modules (security, bad data, duplicates, order, field ownership, client isolation, change events, the nightly file and safety brake, the 200,000-row case study, monitoring, personal data, failure drills, load test). Each has copy-paste commands and the real expected output.
 - **[The automated test suite](docs/testing-guide.md#part-2-the-automated-test-suite):** what each test class proves, and the command to run it.
 
+For each of the twelve problems, the **[tests-by-problem catalogue](docs/problem-tests.md)** shows the data involved (tables, columns, example rows before and after), the API URL with an example request and response, and a direct GitHub link to every test method that proves it.
+
 | What | Command | Time |
 |---|---|---|
 | Unit tests (177); no Docker | `./mvnw test` | ~10 s |
@@ -1180,7 +1182,7 @@ src/main/resources/db/   Flyway migrations (migration/), demo seed (demo/, demo 
 src/test/java/…          unit tests next to their packages; *IT integration tests; support/ and tools/
 ops/                     Prometheus config, alert rules and their tests; Grafana provisioning and dashboard
 loadtest/, scripts/      k6 load test; export generator, demo tour, alert checks, load test runner
-docs/                    testing guide, design note, traceability matrix, curl examples, Postman collection
+docs/                    testing guide, tests by problem, design note, traceability matrix, curl examples, Postman collection
 ```
 
 ```mermaid

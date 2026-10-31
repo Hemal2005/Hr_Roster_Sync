@@ -1,6 +1,6 @@
 # Testing guide
 
-How to verify HR Roster Sync: first by hand, against the running system, then with the automated test suite. Back to the [README](../README.md).
+How to verify HR Roster Sync: first by hand, against the running system, then with the automated test suite. Back to the [README](../README.md). For the same checks organised by problem, with the data model and a GitHub link to every test, see [tests by problem](problem-tests.md).
 
 | Part | For | Time |
 |---|---|---|
