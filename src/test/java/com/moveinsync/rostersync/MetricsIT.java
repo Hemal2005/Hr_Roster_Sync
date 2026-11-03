@@ -24,6 +24,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -133,6 +134,37 @@ class MetricsIT extends ApiTest {
 
 		await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
 				assertThat(scrape()).contains("kafka_consumer_fetch_manager_records_lag"));
+	}
+
+	/**
+	 * HrIngestLagHigh fires at a p99 above 300 s, so the histogram must have buckets past
+	 * that: an event ten minutes late must land below the top finite bucket, not in +Inf.
+	 */
+	@Test
+	void ingestLagAboveTheAlertThresholdIsMeasurable() throws Exception {
+		givenTenant("lagco", "BLR-01");
+		mvc.perform(post("/api/v1/hr/events:batch")
+				.header(HttpHeaders.AUTHORIZATION, bearer("lagco", "workday", "HR_INTEGRATION"))
+				.contentType(MediaType.APPLICATION_JSON)
+				.content(batch(List.of(with(create("L1", 1, "BLR-01", "DAY"), "occurredAt",
+						Instant.now().minus(Duration.ofMinutes(10)).toString())))))
+				.andExpect(status().isOk());
+
+		Map<Double, Double> buckets = lagBuckets(scrape());
+		assertThat(buckets).containsEntry(3600.0, 1.0);
+		assertThat(buckets.entrySet()).filteredOn(bucket -> bucket.getKey() <= 300.0)
+				.isNotEmpty()
+				.allSatisfy(bucket -> assertThat(bucket.getValue()).isZero());
+	}
+
+	/** lagco's finite ingest-lag buckets: upper bound in seconds to cumulative count. */
+	private static Map<Double, Double> lagBuckets(String metrics) {
+		return metrics.lines()
+				.filter(line -> line.startsWith("hr_ingest_lag_seconds_bucket{") && line.contains("tenant=\"lagco\"")
+						&& !line.contains("le=\"+Inf\""))
+				.collect(Collectors.toMap(
+						line -> Double.parseDouble(line.substring(line.indexOf("le=\"") + 4, line.indexOf('"', line.indexOf("le=\"") + 4))),
+						line -> Double.parseDouble(line.substring(line.lastIndexOf(' ') + 1))));
 	}
 
 	/** The value of an untagged-except-application series. */

@@ -50,6 +50,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 public class ApplyService {
 
 	private static final Logger log = LoggerFactory.getLogger(ApplyService.class);
+	private static final Duration MAX_EXPECTED_INGEST_LAG = Duration.ofHours(1);
 
 	private final RecordValidator validator;
 	private final EmployeeRepository employees;
@@ -112,10 +113,13 @@ public class ApplyService {
 		if (result.outcome() == ApplyOutcome.APPLIED && record.occurredAt() != null
 				&& !ReconciliationSource.NAME.equals(sourceSystem)) {
 			Duration lag = Duration.between(record.occurredAt(), clock.instant());
+			// Buckets must reach past the HrIngestLagHigh threshold (300 s); the default top
+			// bucket is 30 s, above which p99 can never be computed.
 			Timer.builder("hr.ingest.lag")
 					.description("From the HR system's occurredAt to the change being committed here")
 					.tag("tenant", tenantId.value())
 					.publishPercentileHistogram()
+					.maximumExpectedValue(MAX_EXPECTED_INGEST_LAG)
 					.register(meters)
 					.record(lag.isNegative() ? Duration.ZERO : lag);
 		}

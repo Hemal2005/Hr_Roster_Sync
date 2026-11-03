@@ -101,3 +101,74 @@ tests:
       - eval_time: 35m
         alertname: HrRejectionSpike
         exp_alerts: []
+
+  # Bucket bounds are the ones the app publishes (MetricsIT checks the 3600 s bucket):
+  # with the default 30 s top bucket this alert could never fire.
+  - name: events arriving about 7 minutes late for 15 minutes open a ticket
+    interval: 1m
+    input_series:
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="274.877906944"}'
+        values: '0x40'
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="366.503875925"}'
+        values: '0x40'
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="458.129844906"}'
+        values: '0+60x40'
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="3600.0"}'
+        values: '0+60x40'
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="+Inf"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HrIngestLagHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HrIngestLagHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              tenant: acme
+            exp_annotations:
+              summary: "acme: p99 HR event lag is 7m 37s"
+              action: "Changes reach us late; check the client's HR integration and our ingest latency."
+
+  - name: events arriving within seconds do not open a ticket
+    interval: 1m
+    input_series:
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="1.0"}'
+        values: '0+60x40'
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="3600.0"}'
+        values: '0+60x40'
+      - series: 'hr_ingest_lag_seconds_bucket{tenant="acme",le="+Inf"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: HrIngestLagHigh
+        exp_alerts: []
+
+  # The dashboard's "Brake trips (24 h)" query. A series created within the window counts
+  # in full (increase() would miss its first trip); an older one counts what it grew.
+  - name: brake trips panel counts first trips and later trips over 24 hours
+    interval: 1h
+    input_series:
+      - series: 'reconciliation_brake_tripped_total{tenant="acme",reason="MISSING_RATIO_EXCEEDED"}'
+        values: '1x25 3x5'
+      - series: 'reconciliation_brake_tripped_total{tenant="acme",reason="FILE_TRUNCATED"}'
+        values: '_x26 1x4'
+    promql_expr_test:
+      - expr: round((sum(increase(reconciliation_brake_tripped_total[24h]) and reconciliation_brake_tripped_total offset 24h) or vector(0)) + (sum(reconciliation_brake_tripped_total unless reconciliation_brake_tripped_total offset 24h) or vector(0)))
+        eval_time: 28h
+        exp_samples:
+          - labels: '{}'
+            value: 3
+
+  - name: brake trips panel shows 0, not "no data", when nothing ever tripped
+    interval: 1m
+    input_series:
+      - series: 'outbox_depth{application="hr-roster-sync"}'
+        values: '0x10'
+    promql_expr_test:
+      - expr: round((sum(increase(reconciliation_brake_tripped_total[24h]) and reconciliation_brake_tripped_total offset 24h) or vector(0)) + (sum(reconciliation_brake_tripped_total unless reconciliation_brake_tripped_total offset 24h) or vector(0)))
+        eval_time: 5m
+        exp_samples:
+          - labels: '{}'
+            value: 0

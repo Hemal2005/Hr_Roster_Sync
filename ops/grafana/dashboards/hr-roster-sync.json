@@ -112,7 +112,7 @@
       "id": 4,
       "type": "stat",
       "title": "Brake trips (24 h)",
-      "description": "Runs held for an operator.",
+      "description": "Runs held for an operator. A tenant's first trip of a kind creates its counter already at 1, which increase() cannot see, so series that did not exist 24 h ago count in full.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -130,7 +130,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(reconciliation_brake_tripped_total[24h]))",
+          "expr": "round((sum(increase(reconciliation_brake_tripped_total[24h]) and reconciliation_brake_tripped_total offset 24h) or vector(0)) + (sum(reconciliation_brake_tripped_total unless reconciliation_brake_tripped_total offset 24h) or vector(0)))",
           "legendFormat": "trips"
         }
       ],
